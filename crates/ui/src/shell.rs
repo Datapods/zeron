@@ -7155,7 +7155,7 @@ impl Shell {
             .role(gpui::Role::Button)
             .aria_label(format!("Account menu: {user_line}"))
             .relative()
-            .size(px(28.0))
+            .size(px(SIDEBAR_ACTIVE_HARNESS_ICON_SIZE + 8.0))
             .flex_none()
             .rounded_full()
             .p(px(4.0))
@@ -7194,7 +7194,7 @@ impl Shell {
             .child(
                 // Avatar: white circle, initial in near-black (zeron user-menu.tsx).
                 div()
-                    .size(px(20.0))
+                    .size(px(SIDEBAR_ACTIVE_HARNESS_ICON_SIZE))
                     .flex_none()
                     .rounded_full()
                     .bg(theme.text)
@@ -7202,8 +7202,8 @@ impl Shell {
                     .items_center()
                     .justify_center()
                     .font_family(theme.font_mono.clone())
-                    .text_size(px(11.0))
-                    .line_height(px(20.0))
+                    .text_size(px(9.0))
+                    .line_height(px(SIDEBAR_ACTIVE_HARNESS_ICON_SIZE))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(theme.bg)
                     .child(div().w_full().text_center().child(initial)),
