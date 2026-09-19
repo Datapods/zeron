@@ -4,7 +4,7 @@ Native GPUI screenshots from the isolated sidebar fixture with a synthetic accou
 ZERON_SIDEBAR_COMPACT=1 ZERON_SIDEBAR_ACCOUNT=1 cargo run -p zeron-ui --example sidebar-fixture --features project-palette-fixture
 ```
 
-The sidebar footer uses a 28px avatar button with a 20px circle and a centered
+The sidebar footer uses a circular 28px avatar button with a 20px circle and a centered
 monospace initial. It shows no account name or Alpha label. The account menu
 opens to the right, clamped within the window, and retains its email and actions.
 

@@ -7157,7 +7157,7 @@ impl Shell {
             .relative()
             .size(px(28.0))
             .flex_none()
-            .rounded(px(8.0))
+            .rounded_full()
             .p(px(4.0))
             .flex()
             .flex_row()
