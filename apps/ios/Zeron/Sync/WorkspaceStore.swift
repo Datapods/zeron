@@ -566,7 +566,7 @@ final class WorkspaceStore {
         do {
             return try await listFoldersDetailed(deviceId: deviceId, path: path)
         } catch {
-            lastRelayError = error.localizedDescription
+            lastRelayError = describeTransportError(error)
             return nil
         }
     }
@@ -658,7 +658,7 @@ final class WorkspaceStore {
                 .call(method: "SwitchRef", params: ["repoPath": repoPath, "refName": refName])
             return nil
         } catch {
-            return error.localizedDescription
+            return describeTransportError(error)
         }
     }
 

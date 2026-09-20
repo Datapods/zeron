@@ -68,7 +68,8 @@ enum DocDisk {
     /// Import the chat2 snapshot; returns its cursor and whether a completed
     /// catch-up verified it, or nil when absent/unreadable.
     static func loadChat2(into doc: LoroDoc, id: String)
-        -> (cursor: UInt64, verified: Bool, outbox: [(batchId: String, bytes: Data)])? {
+        -> (cursor: UInt64, verified: Bool, firstContactQueued: Bool,
+            outbox: [(batchId: String, bytes: Data)])? {
         guard let data = try? Data(contentsOf: chat2URL(for: id)),
               data.count >= 16 else { return nil }
         let magic = data.prefix(8)
@@ -81,13 +82,16 @@ enum DocDisk {
         }
         var snapshotOffset: Int
         let verified: Bool
+        let firstContactQueued: Bool
         var outbox: [(batchId: String, bytes: Data)] = []
         if isLegacy {
             snapshotOffset = 16
             verified = false
+            firstContactQueued = false
         } else if hasOutbox {
             guard data.count >= 21 else { return nil }
             verified = data[16] & 1 != 0
+            firstContactQueued = data[16] & 2 != 0
             let count = Int(readUInt32LE(data, at: 17))
             var offset = 21
             for _ in 0..<count {
@@ -108,22 +112,26 @@ enum DocDisk {
             guard data.count >= 17 else { return nil }
             snapshotOffset = 17
             verified = data[16] & 1 != 0
+            firstContactQueued = false
         }
-        guard data.count > snapshotOffset else { return (cursor, verified, outbox) }
+        guard data.count > snapshotOffset else {
+            return (cursor, verified, firstContactQueued, outbox)
+        }
         guard (try? doc.importWith(bytes: data.subdata(in: snapshotOffset..<data.count),
                                    origin: "disk")) != nil else { return nil }
-        return (cursor, verified, outbox)
+        return (cursor, verified, firstContactQueued, outbox)
     }
 
     /// Atomically persist the chat2 doc snapshot + its room cursor.
     @discardableResult
     static func saveChat2(doc: LoroDoc, id: String, cursor: UInt64, verified: Bool,
+                          firstContactQueued: Bool = false,
                           outbox: [(batchId: String, bytes: Data)] = []) -> Bool {
         guard let snapshot = try? doc.export(mode: .snapshot) else { return false }
         var data = chat2OutboxMagic
         var le = cursor.littleEndian
         withUnsafeBytes(of: &le) { data.append(contentsOf: $0) }
-        data.append(verified ? 1 : 0)
+        data.append((verified ? 1 : 0) | (firstContactQueued ? 2 : 0))
         var count = UInt32(outbox.count).littleEndian
         withUnsafeBytes(of: &count) { data.append(contentsOf: $0) }
         for push in outbox {
@@ -150,6 +158,21 @@ enum DocDisk {
     private static func readUInt32LEIfPresent(_ data: Data, at offset: Int) -> UInt32? {
         guard offset >= 0, offset <= data.count - 4 else { return nil }
         return readUInt32LE(data, at: offset)
+    }
+
+    static func chat2PendingOutboxCount(at url: URL) -> Int {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return 0 }
+        defer { try? handle.close() }
+        guard let header = try? handle.read(upToCount: 21), header.count >= 8,
+              header.prefix(8) == chat2OutboxMagic, header.count >= 21 else {
+            return 0
+        }
+        let count = readUInt32LE(header, at: 17)
+        return Int(count)
+    }
+
+    static func chat2HasPendingOutbox(id: String) -> Bool {
+        chat2PendingOutboxCount(at: chat2URL(for: id)) > 0
     }
 
     @discardableResult
@@ -231,8 +254,11 @@ enum DocDisk {
                 && !$0.lastPathComponent.hasPrefix("ws3_")
                 && !$0.lastPathComponent.hasPrefix("registry1_")
         }
-        guard sessions.count > keep else { return }
-        let sorted = sessions.sorted {
+        let deletable = sessions.filter {
+            chat2PendingOutboxCount(at: $0) == 0
+        }
+        guard deletable.count > keep else { return }
+        let sorted = deletable.sorted {
             let a = (try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
             let b = (try? $1.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
             return a > b
@@ -257,6 +283,8 @@ final class DocSaver {
     private let save: () -> Bool
     private var generation = 0
     private var dirty = false
+    var onSaved: (() -> Void)?
+    var isDirty: Bool { dirty }
 
     init(save: @escaping () -> Bool) {
         self.save = save
@@ -275,12 +303,19 @@ final class DocSaver {
 
     func flush() {
         guard dirty else { return }
+        _ = commitNow()
+    }
+
+    @discardableResult
+    func commitNow() -> Bool {
         guard save() else {
             dirty = true
             scheduleRetry()
-            return
+            return false
         }
         dirty = false
+        onSaved?()
+        return true
     }
 
     private func scheduleRetry() {

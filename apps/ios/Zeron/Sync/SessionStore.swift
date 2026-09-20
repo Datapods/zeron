@@ -71,7 +71,9 @@ final class SessionStore {
     /// C2 rule), so content and cursor can never diverge.
     @ObservationIgnored private var cursor: UInt64 = 0
     @ObservationIgnored private var cursorVerified = false
+    @ObservationIgnored private var firstContactQueued = false
     @ObservationIgnored private(set) var outbox: [(batchId: String, bytes: Data)] = []
+    @ObservationIgnored private var admitted: Set<String> = []
     private var chatRoom: ChatRoomClient?
     private var subscriptions: [Subscription] = []
     private let config: AppConfig
@@ -158,6 +160,7 @@ final class SessionStore {
         if let saved = DocDisk.loadChat2(into: doc, id: chatId) {
             cursor = saved.cursor
             cursorVerified = saved.verified
+            firstContactQueued = saved.firstContactQueued
             outbox = saved.outbox
             project()
         } else if DocDisk.legacySnapshotExists(id: chatId) {
@@ -169,7 +172,12 @@ final class SessionStore {
         saver = DocSaver { [weak self] in
             guard let self else { return false }
             return DocDisk.saveChat2(doc: self.doc, id: self.chatId, cursor: self.cursor,
-                                     verified: self.cursorVerified, outbox: self.outbox)
+                                     verified: self.cursorVerified,
+                                     firstContactQueued: self.firstContactQueued,
+                                     outbox: self.outbox)
+        }
+        saver?.onSaved = { [weak self] in
+            self?.admitDurableBatches()
         }
         // Subscription BEFORE any connect: every local commit lands in the
         // client when it exists; commits made earlier are covered by the
@@ -181,10 +189,8 @@ final class SessionStore {
                 guard let self else { return }
                 let batchId = UUID().uuidString.lowercased()
                 self.outbox.append((batchId: batchId, bytes: bytes))
-                self.saver?.poke()
-                if let room = self.chatRoom {
-                    Task { await room.enqueue(batchId: batchId, update: bytes) }
-                }
+                _ = self.saver?.commitNow()
+                self.admitDurableBatches()
             }
         }
         subscriptions.append(localSub)
@@ -299,6 +305,7 @@ final class SessionStore {
             },
             delegate: delegate)
         chatRoom = client
+        admitDurableBatches()
         // First contact with the room (cursor 0): everything committed
         // BEFORE the local-update subscription saw a client — an adopt's
         // requeued commands, sends queued while waiting for the roomGen
@@ -307,23 +314,18 @@ final class SessionStore {
         // on unpushed deps sit in peers' pending-dep buffers forever). Push
         // the doc's full update log as the join's first batch; once acked
         // the cursor moves and this never re-arms.
-        if cursor == 0,
-           let all = try? doc.export(mode: .updates(from: VersionVector())), !all.isEmpty {
-            // The durable snapshot and outbox are written atomically. A
-            // cursor-zero full-log push therefore covers every restored
-            // outbox entry; replace them with one stable full-log batch rather
-            // than sending the same operations under multiple IDs.
-            let batchId = UUID().uuidString.lowercased()
-            outbox = [(batchId: batchId, bytes: all)]
-            saver?.poke()
-            Task { await client.enqueue(batchId: batchId, update: all) }
-        } else {
-            let restored = outbox
-            Task {
-                for push in restored {
-                    await client.enqueue(batchId: push.batchId, update: push.bytes)
+        if cursor == 0, !firstContactQueued {
+            if let all = try? doc.export(mode: .updates(from: VersionVector())), !all.isEmpty {
+                if all.count <= ChatRoomClient.maxPushBytes {
+                    let batchId = UUID().uuidString.lowercased()
+                    outbox.append((batchId: batchId, bytes: all))
+                } else {
+                    roomLog.error("chat2 \(self.chatId, privacy: .public): first-contact update exceeds push cap; replaying durable batches only")
                 }
             }
+            firstContactQueued = true
+            _ = saver?.commitNow()
+            admitDurableBatches()
         }
         Task { await client.start() }
     }
@@ -331,10 +333,21 @@ final class SessionStore {
     func retirePush(batchId: String) {
         let oldCount = outbox.count
         outbox.removeAll { $0.batchId == batchId }
+        admitted.remove(batchId)
         if outbox.count != oldCount {
             saver?.poke()
         }
     }
+
+    private func admitDurableBatches() {
+        guard !outbox.isEmpty, saver?.isDirty == false, let room = chatRoom else { return }
+        for push in outbox where !admitted.contains(push.batchId) {
+            admitted.insert(push.batchId)
+            Task { await room.enqueue(batchId: push.batchId, update: push.bytes) }
+        }
+    }
+
+    var admittedBatchIDs: Set<String> { admitted }
 
     static func containsFrontier(_ frontier: Data, in doc: LoroDoc) -> Bool {
         guard !frontier.isEmpty,
@@ -398,10 +411,13 @@ final class SessionStore {
     func stop() {
         subscriptions.removeAll()
         saver?.flush()
+        saver?.onSaved = nil
+        saver = nil
         if let chatRoom {
             Task { await chatRoom.stop() }
         }
         chatRoom = nil
+        hostRelay = nil
         connected = false
     }
 
@@ -765,7 +781,7 @@ final class SessionStore {
                     self.nudgeHost()
                     return
                 } catch {
-                    roomLog.warning("chat2 \(self.chatId, privacy: .public): attachment transfer failed (\(error.localizedDescription, privacy: .public)); retrying in \(backoffMs)ms")
+                    roomLog.warning("chat2 \(self.chatId, privacy: .public): attachment transfer failed (\(describeTransportError(error), privacy: .public)); retrying in \(backoffMs)ms")
                     await OnlineBus.shared.waitBackoff(ms: backoffMs)
                     backoffMs = min(backoffMs * 2, Self.transferBackoffCapMs)
                 }

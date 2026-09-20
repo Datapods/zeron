@@ -320,7 +320,7 @@ actor RegistryClient {
         } catch {
             // Protocol breakdown — same as the Rust client: redial rather
             // than run blind against a server we can't parse.
-            roomLog.error("registry: unparseable frame (\(String(describing: error), privacy: .public)); redialing")
+            roomLog.error("registry: unparseable frame (\(describeTransportError(error), privacy: .public)); redialing")
             await onSocketError(gen: gen)
             return
         }
@@ -389,6 +389,7 @@ actor RegistryClient {
                 }
                 group.addTask {
                     try await Task.sleep(nanoseconds: RegistryClient.silenceLeaseNs)
+                    socket.cancel(with: .goingAway, reason: nil)
                     throw RegistrySendTimeout()
                 }
                 defer { group.cancelAll() }
@@ -396,7 +397,7 @@ actor RegistryClient {
             }
         } catch {
             guard gen == generation, !closed else { return }
-            roomLog.error("registry: websocket send failed (\(String(describing: error), privacy: .public)); redialing")
+            roomLog.error("registry: websocket send failed (\(describeTransportError(error), privacy: .public)); redialing")
             await onSocketError(gen: gen)
         }
     }

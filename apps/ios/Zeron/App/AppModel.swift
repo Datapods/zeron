@@ -6,6 +6,7 @@ import Foundation
 import Network
 import Observation
 import SwiftUI
+import UIKit
 import os
 
 @MainActor
@@ -25,6 +26,9 @@ final class AppModel {
     /// from (home pill, composer notice, Queued/Failed badges).
     let connectivity = ConnectivityCenter()
     private var sessionStores: [String: SessionStore] = [:]
+    @ObservationIgnored private var storeLastUsed: [String: UInt64] = [:]
+    @ObservationIgnored private var usageClock: UInt64 = 0
+    @ObservationIgnored private var memoryWarningObserver: NSObjectProtocol?
     private var config: AppConfig?
     @ObservationIgnored private var pathMonitor: NWPathMonitor?
     @ObservationIgnored private var lastPathKey: String?
@@ -35,6 +39,24 @@ final class AppModel {
     @ObservationIgnored @AppStorage("userId") var storedUserId = ""
     @ObservationIgnored @AppStorage("orgId") var storedOrgId = ""
     @ObservationIgnored @AppStorage("deviceId") var storedDeviceId = ""
+
+    init() {
+        memoryWarningObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.didReceiveMemoryWarningNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.evictForMemoryWarning()
+            }
+        }
+    }
+
+    deinit {
+        if let memoryWarningObserver {
+            NotificationCenter.default.removeObserver(memoryWarningObserver)
+        }
+    }
 
     var deviceId: String {
         if storedDeviceId.isEmpty {
@@ -247,6 +269,7 @@ final class AppModel {
         workspace = nil
         sessionStores.values.forEach { $0.stop() }
         sessionStores.removeAll()
+        storeLastUsed.removeAll()
         config = nil
         demo = nil
         demoPinnedSessionIds = []
@@ -714,6 +737,7 @@ final class AppModel {
         if let demo { return demo.sessionStore(for: chat.id) }
         guard let config else { return nil }
         if let existing = sessionStores[chat.id] {
+            touchStore(chat.id)
             existing.hostDeviceId = chat.deviceId
             // The registry flip to chat2 can land while the store is open —
             // views re-derive `chat` from the registry on every change, so
@@ -729,6 +753,7 @@ final class AppModel {
             self?.workspace?.peerLiveness(deviceId) ?? .unknown
         }
         sessionStores[chat.id] = store
+        touchStore(chat.id)
         store.start()
         store.updateRoomGen(chat.roomGen)
         return store
@@ -804,7 +829,9 @@ final class AppModel {
     }
 
     func releaseSessionStore(chatId: String) {
-        // Preloaded stores stay warm — nothing to evict on navigation.
+        guard sessionStores[chatId] != nil else { return }
+        touchStore(chatId)
+        evictColdStores()
     }
 
     /// Warm every non-archived session: stores hydrate from disk instantly
@@ -822,18 +849,100 @@ final class AppModel {
     /// an undialed chat's row stays live regardless, and opening it releases
     /// its dial instantly.
     static let warmDialCap = 8
+    static let warmStoreCap = 12
+
+    nonisolated static func warmPreloadIDs(
+        chats: [Chat],
+        hasPendingOutbox: (String) -> Bool,
+        cap: Int
+    ) -> [String] {
+        let limit = max(0, cap)
+        var ids: [String] = []
+        var selected = Set<String>()
+        for chat in chats.prefix(limit) where selected.insert(chat.id).inserted {
+            ids.append(chat.id)
+        }
+        for chat in chats.dropFirst(limit)
+            where hasPendingOutbox(chat.id) && selected.insert(chat.id).inserted {
+            ids.append(chat.id)
+        }
+        return ids
+    }
+
+    nonisolated static func evictionOrder(
+        lastUsed: [String: UInt64],
+        protected: (String) -> Bool
+    ) -> [String] {
+        lastUsed.keys
+            .filter { !protected($0) }
+            .sorted {
+                let lhs = lastUsed[$0] ?? 0
+                let rhs = lastUsed[$1] ?? 0
+                return lhs == rhs ? $0 < $1 : lhs < rhs
+            }
+    }
+
+    private func touchStore(_ id: String) {
+        usageClock &+= 1
+        storeLastUsed[id] = usageClock
+    }
+
+    private func storeIsProtected(_ store: SessionStore) -> Bool {
+        !store.pendingSends.isEmpty
+            || !store.outbox.isEmpty
+            || store.entries.last?.status == .streaming
+    }
+
+    private func evictColdStores() {
+        guard sessionStores.count > Self.warmStoreCap else { return }
+        let order = Self.evictionOrder(lastUsed: storeLastUsed) { [weak self] id in
+            guard let self, let store = self.sessionStores[id] else { return false }
+            return self.storeIsProtected(store)
+        }
+        var removed = 0
+        for id in order where sessionStores.count > Self.warmStoreCap {
+            guard let store = sessionStores.removeValue(forKey: id) else { continue }
+            store.stop()
+            storeLastUsed.removeValue(forKey: id)
+            removed += 1
+        }
+        if removed > 0 {
+            roomLog.info("session store eviction removed \(removed, privacy: .public) cold store(s)")
+        }
+    }
+
+    private func evictForMemoryWarning() {
+        let newest = storeLastUsed.max { $0.value < $1.value }?.key
+        let before = sessionStores.count
+        let order = Self.evictionOrder(lastUsed: storeLastUsed) { [weak self] id in
+            guard let self, let store = self.sessionStores[id] else { return true }
+            return id == newest || self.storeIsProtected(store)
+        }
+        for id in order {
+            guard let store = sessionStores.removeValue(forKey: id) else { continue }
+            store.stop()
+            storeLastUsed.removeValue(forKey: id)
+        }
+        roomLog.info("memory warning evicted \(before - self.sessionStores.count, privacy: .public) of \(before, privacy: .public) session store(s)")
+    }
 
     func preloadSessions() {
         guard demo == nil, let config else { return }
         var stagger: UInt64 = 0
         var released = 0
-        for chat in overviewChats where sessionStores[chat.id] == nil {
+        let preloadIDs = Self.warmPreloadIDs(
+            chats: overviewChats,
+            hasPendingOutbox: { DocDisk.chat2HasPendingOutbox(id: $0) },
+            cap: Self.warmStoreCap
+        )
+        for chat in overviewChats where preloadIDs.contains(chat.id) && sessionStores[chat.id] == nil {
             let store = SessionStore(chatId: chat.id, config: config)
             store.hostDeviceId = chat.deviceId
             store.hostLiveness = { [weak self] deviceId in
                 self?.workspace?.peerLiveness(deviceId) ?? .unknown
             }
             sessionStores[chat.id] = store
+            touchStore(chat.id)
             store.start(holdDial: true)
             store.updateRoomGen(chat.roomGen)
             guard released < Self.warmDialCap else { continue }

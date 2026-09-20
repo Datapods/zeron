@@ -154,6 +154,7 @@ actor ChatRoomClient {
     private var lastProtocolRx = DispatchTime.now()
     private var helloSentAt: DispatchTime?
     private var backfillStartedAt: DispatchTime?
+    private var rowPhaseStartedAt: DispatchTime?
     private var probeSentAt: DispatchTime?
 
     init(chatId: String,
@@ -392,6 +393,7 @@ actor ChatRoomClient {
         checkpointBuffer = nil
         helloSentAt = nil
         backfillStartedAt = nil
+        rowPhaseStartedAt = nil
         probeSentAt = nil
         gapRepair = false
         gapRepairs = 0
@@ -528,11 +530,9 @@ actor ChatRoomClient {
             await onSocketError(gen: gen)
             return
         }
-        let backfillDeadline = fetchInFlight
-            ? ChatRoomClient.checkpointDeadlineNs
-            : ChatRoomClient.rowBackfillDeadlineNs
-        if let started = backfillStartedAt,
-           now - started.uptimeNanoseconds > backfillDeadline {
+        if Self.backfillExpired(now: .now(), fetchInFlight: fetchInFlight,
+                                backfillStartedAt: backfillStartedAt,
+                                rowPhaseStartedAt: rowPhaseStartedAt) {
             roomLog.warning("chat2 \(self.chatId, privacy: .public): backfill did not complete within deadline; redialing")
             await onSocketError(gen: gen)
             return
@@ -715,6 +715,7 @@ actor ChatRoomClient {
     private func completeCheckpointFetch(seq: UInt64) async {
         let bytes = await fetchCheckpoint()
         fetchInFlight = false
+        rowPhaseStartedAt = .now()
         checkpointProgressAt = nil
         guard !closed else { return }
         guard let bytes else {
@@ -774,6 +775,7 @@ actor ChatRoomClient {
         }
         guard backfillStartedAt != nil else { return }
         backfillStartedAt = nil
+        rowPhaseStartedAt = nil
         let wasResumed = resumed
         resumed = true
         joined = true
@@ -881,6 +883,7 @@ actor ChatRoomClient {
                 }
                 group.addTask {
                     try await Task.sleep(nanoseconds: ChatRoomClient.silenceLeaseNs)
+                    socket.cancel(with: .goingAway, reason: nil)
                     throw SendTimeout()
                 }
                 defer { group.cancelAll() }
@@ -888,9 +891,23 @@ actor ChatRoomClient {
             }
         } catch {
             guard gen == generation, !closed else { return }
-            roomLog.error("chat2 \(self.chatId, privacy: .public): websocket send failed (\(String(describing: error), privacy: .public)); redialing")
+            roomLog.error("chat2 \(self.chatId, privacy: .public): websocket send failed (\(describeTransportError(error), privacy: .public)); redialing")
             await onSocketError(gen: gen)
         }
+    }
+
+    static func backfillExpired(
+        now: DispatchTime,
+        fetchInFlight: Bool,
+        backfillStartedAt: DispatchTime?,
+        rowPhaseStartedAt: DispatchTime?
+    ) -> Bool {
+        guard let started = fetchInFlight ? backfillStartedAt : (rowPhaseStartedAt ?? backfillStartedAt) else {
+            return false
+        }
+        let elapsed = now.uptimeNanoseconds &- started.uptimeNanoseconds
+        let deadline = fetchInFlight ? checkpointDeadlineNs : rowBackfillDeadlineNs
+        return elapsed > deadline
     }
 
     // MARK: Checkpoint fetch (GET /chat2/{chatId}/checkpoint, Range resume)

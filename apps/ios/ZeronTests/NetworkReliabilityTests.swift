@@ -37,10 +37,46 @@ final class NetworkReliabilityTests: XCTestCase {
         let loaded = try XCTUnwrap(DocDisk.loadChat2(into: restoredDoc, id: id))
         XCTAssertEqual(loaded.cursor, 42)
         XCTAssertTrue(loaded.verified)
+        XCTAssertFalse(loaded.firstContactQueued)
         XCTAssertEqual(loaded.outbox.map(\.batchId), outbox.map(\.batchId))
         XCTAssertEqual(loaded.outbox.map(\.bytes), outbox.map(\.bytes))
         XCTAssertEqual(restoredDoc.getDeepValue().mapValue?["test"]?.mapValue?["value"]?.stringValue,
                        "persisted")
+    }
+
+    func testChat2PendingOutboxProtectsOldestSnapshotDuringPrune() throws {
+        let ids = (0..<3).map { "prune-\($0)-\(UUID().uuidString)" }
+        defer {
+            ids.forEach { try? FileManager.default.removeItem(at: DocDisk.chat2URL(for: $0)) }
+        }
+        for (index, id) in ids.enumerated() {
+            let outbox: [(batchId: String, bytes: Data)] = index == 0
+                ? [("pending", Data([1]))] : []
+            XCTAssertTrue(DocDisk.saveChat2(doc: LoroDoc(), id: id, cursor: 0,
+                                            verified: false, outbox: outbox))
+            let date = Date(timeIntervalSince1970: TimeInterval(index + 1))
+            try FileManager.default.setAttributes([.modificationDate: date],
+                                                  ofItemAtPath: DocDisk.chat2URL(for: id).path)
+        }
+        DocDisk.prune(keep: 1)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: DocDisk.chat2URL(for: ids[0]).path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: DocDisk.chat2URL(for: ids[1]).path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: DocDisk.chat2URL(for: ids[2]).path))
+    }
+
+    func testBackfillDeadlineUsesSeparateCheckpointAndRowClocks() {
+        let now = DispatchTime.now().uptimeNanoseconds
+        let checkpoint = DispatchTime(uptimeNanoseconds: now - 150_000_000_000)
+        let recentRows = DispatchTime(uptimeNanoseconds: now - 10_000_000_000)
+        let oldRows = DispatchTime(uptimeNanoseconds: now - 130_000_000_000)
+        XCTAssertFalse(ChatRoomClient.backfillExpired(
+            now: .now(), fetchInFlight: false,
+            backfillStartedAt: checkpoint, rowPhaseStartedAt: recentRows
+        ))
+        XCTAssertTrue(ChatRoomClient.backfillExpired(
+            now: .now(), fetchInFlight: false,
+            backfillStartedAt: checkpoint, rowPhaseStartedAt: oldRows
+        ))
     }
 
     func testChat2Snapshot02LoadsWithEmptyOutbox() throws {
@@ -115,6 +151,40 @@ final class NetworkReliabilityTests: XCTestCase {
         XCTAssertEqual(store.outbox.map(\.bytes), [Data([1]), Data([2])])
         store.retirePush(batchId: "stable-a")
         XCTAssertEqual(store.outbox.map(\.batchId), ["stable-b"])
+    }
+
+    @MainActor
+    func testCursorZeroFirstContactPreservesRestoredBatchesAndFlag() throws {
+        let id = "first-contact-\(UUID().uuidString)"
+        let config = AppConfig(edgeURL: URL(string: "http://localhost:1")!, mode: .dev,
+                               userId: "u", orgId: "o", deviceId: "phone",
+                               deviceName: "phone", tokens: nil, devBearer: "u@o")
+        defer { try? FileManager.default.removeItem(at: DocDisk.chat2URL(for: id)) }
+        let doc = LoroDoc()
+        try doc.getMap(id: "test").insert(key: "value", v: "local")
+        doc.commit()
+        let restored: [(batchId: String, bytes: Data)] = [
+            ("restored-a", Data([1])),
+            ("restored-b", Data([2])),
+        ]
+        XCTAssertTrue(DocDisk.saveChat2(doc: doc, id: id, cursor: 0, verified: false,
+                                        outbox: restored))
+
+        let store = SessionStore(chatId: id, config: config)
+        store.start()
+        store.updateRoomGen(2)
+        XCTAssertEqual(store.outbox.count, 3)
+        XCTAssertTrue(store.outbox.map(\.batchId).contains("restored-a"))
+        XCTAssertTrue(store.outbox.map(\.batchId).contains("restored-b"))
+        let loaded = try XCTUnwrap(DocDisk.loadChat2(into: LoroDoc(), id: id))
+        XCTAssertTrue(loaded.firstContactQueued)
+
+        store.stop()
+        let restarted = SessionStore(chatId: id, config: config)
+        restarted.start()
+        restarted.updateRoomGen(2)
+        XCTAssertEqual(restarted.outbox.count, 3)
+        restarted.stop()
     }
 
     // MARK: versionTriple (proto version_triple port)
