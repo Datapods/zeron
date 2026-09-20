@@ -102,6 +102,7 @@ struct ComposerShell<Chips: View>: View {
                 .padding(.vertical, expanded ? 4 : 5)
                 .frame(minWidth: compact ? 140 : nil,
                        minHeight: expanded && !compact ? 64 : nil, alignment: .topLeading)
+                .fixedSize(horizontal: false, vertical: true)
             if expanded {
                 HStack(spacing: 8) {
                     if onAttach != nil {
