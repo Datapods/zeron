@@ -218,13 +218,14 @@ final class TranscriptScrollMatrixTests: XCTestCase {
             XCTFail("[\(context)] tail \(lastRow.id) must be realized; distance \(harness.scroll.distanceFromBottom)", file: file, line: line)
             return
         }
-        if tail.maxY < viewport.minY || viewport.maxY - tail.maxY >= 40 || !harness.scroll.pinned {
+        if tail.maxY < viewport.minY || viewport.maxY - tail.maxY >= 64 || !harness.scroll.pinned {
             attachScreenshot(context)
         }
         XCTAssertGreaterThan(tail.height, 0, "[\(context)]", file: file, line: line)
         XCTAssertGreaterThan(tail.maxY, viewport.minY, "[\(context)] tail above viewport", file: file, line: line)
         XCTAssertLessThanOrEqual(tail.maxY, viewport.maxY + 2, "[\(context)] tail below viewport", file: file, line: line)
-        XCTAssertLessThan(viewport.maxY - tail.maxY, 40, "[\(context)] blank space under tail", file: file, line: line)
+        // 24pt bottom spacing plus a block's own trailing padding (lists, tables, fences).
+        XCTAssertLessThan(viewport.maxY - tail.maxY, 64, "[\(context)] blank space under tail", file: file, line: line)
         XCTAssertTrue(harness.scroll.pinned, "[\(context)] must remain pinned", file: file, line: line)
         assertNoOverscroll(context, file: file, line: line)
     }
@@ -265,6 +266,18 @@ final class TranscriptScrollMatrixTests: XCTestCase {
         table.scrollViewDidEndDragging(table, willDecelerate: false)
     }
 
+    private func visibleLayout() -> String {
+        let rows = harness.store.transcriptCache.rows(revision: harness.store.revision,
+            entries: harness.store.entries, pendingSends: harness.store.pendingSends)
+        let paths = (table.indexPathsForVisibleRows ?? []).sorted()
+        let lines = paths.map { path -> String in
+            let rect = table.rectForRow(at: path)
+            let id = path.row < rows.count ? rows[path.row].id : "?"
+            return "  \(path.row) \(id) y=\(rect.minY) h=\(rect.height)"
+        }
+        return "offset=\(table.contentOffset.y) content=\(table.contentSize.height)\n" + lines.joined(separator: "\n")
+    }
+
     private func anchorCell() -> UITableViewCell? {
         let top = table.superview!.convert(table.superview!.bounds, to: window).minY
         return table.visibleCells.first {
@@ -294,17 +307,22 @@ final class TranscriptScrollMatrixTests: XCTestCase {
         await forEachCorpus("stream-pinned") { corpus, context in
             assertTailVisible(context + "/open")
             var offsets: [CGFloat] = []
+            var heights: [CGFloat] = []
             for chunk in 0..<Self.chunkCount {
                 applyChunk(corpus, index: chunk)
                 await settle(80)
                 offsets.append(table.contentOffset.y)
+                heights.append(table.contentSize.height)
                 assertTailVisible(context + "/chunk\(chunk)")
             }
             await settle()
             assertTailVisible(context + "/final")
-            // Content only grows, so a pinned viewport must never scroll back up.
+            // A pinned viewport may only move back up by as much as the
+            // content itself shrank (a row settling from its estimate).
             for i in 1..<offsets.count {
-                XCTAssertGreaterThanOrEqual(offsets[i], offsets[i - 1] - 1, "[\(context)] backward jump at chunk \(i): \(offsets)")
+                let shrink = max(0, heights[i - 1] - heights[i])
+                XCTAssertGreaterThanOrEqual(offsets[i], offsets[i - 1] - shrink - 1,
+                    "[\(context)] backward jump at chunk \(i): offsets \(offsets) heights \(heights)")
             }
         }
     }
@@ -325,10 +343,21 @@ final class TranscriptScrollMatrixTests: XCTestCase {
             let start = presentedY(cell)
             var drift: [CGFloat] = []
             for chunk in 1..<Self.chunkCount {
+                let before = visibleLayout()
                 applyChunk(corpus, index: chunk)
                 for _ in 0..<4 {
                     try? await Task.sleep(for: .milliseconds(16))
-                    drift.append(abs(presentedY(cell) - start))
+                    let error = abs(presentedY(cell) - start)
+                    if error >= 4, (drift.max() ?? 0) < 4 {
+                        let rows = harness.store.transcriptCache.rows(revision: harness.store.revision,
+                            entries: harness.store.entries, pendingSends: harness.store.pendingSends)
+                        let diagnostic = XCTAttachment(string: "chunk \(chunk) offset \(table.contentOffset.y) contentHeight \(table.contentSize.height)\nlast rows: \(rows.suffix(6).map { "\($0.id)@\($0.version)" })\nbefore:\n\(before)\nafter:\n\(visibleLayout())")
+                        diagnostic.name = context + "/drift-chunk\(chunk)"
+                        diagnostic.lifetime = .keepAlways
+                        add(diagnostic)
+                        attachScreenshot(context + "/drift-chunk\(chunk)")
+                    }
+                    drift.append(error)
                 }
                 XCTAssertFalse(harness.scroll.pinned, "[\(context)] streaming must not re-pin a reader")
                 assertNoOverscroll(context + "/chunk\(chunk)")
@@ -337,6 +366,8 @@ final class TranscriptScrollMatrixTests: XCTestCase {
             assertViewportRealized(context + "/after-stream")
             XCTAssertTrue(harness.scroll.showJump || harness.scroll.distanceFromBottom <= TranscriptView.jumpThreshold,
                           "[\(context)] jump affordance must appear when far from bottom")
+            // Same sequence as the jump button in TranscriptView.
+            harness.scroll.arm()
             harness.scroll.jumpToLatest?(true)
             await settle()
             assertTailVisible(context + "/after-jump")
