@@ -282,10 +282,14 @@ final class AppModel {
             guard let self, self.demo == nil, let workspace = self.workspace else { return true }
             return workspace.connected
         }
+        connectivity.registryRetryAt = { [weak self] in
+            self?.workspace?.retryAt
+        }
         connectivity.chatRooms = { [weak self] in
             guard let self else { return [] }
             return self.sessionStores.compactMap { id, store in
-                store.roomActive ? (id: id, connected: store.connected) : nil
+                store.roomActive ? (id: id, connected: store.connected,
+                                    retryAt: store.retryAt) : nil
             }
         }
         connectivity.hasPendingSends = { [weak self] in
@@ -386,7 +390,15 @@ final class AppModel {
         }
         if let live = await workspace?.listModels(deviceId: deviceId, harness: harness),
            !live.isEmpty {
-            return HarnessCatalog.normalize(harness: harness, models: live)
+            let normalized = HarnessCatalog.normalize(harness: harness, models: live)
+            if !normalized.isEmpty {
+                _ = DocDisk.saveModels(normalized, deviceId: deviceId, harness: harness)
+                return normalized
+            }
+        }
+        if let cached = DocDisk.loadModels(deviceId: deviceId, harness: harness),
+           !cached.isEmpty {
+            return cached
         }
         return HarnessCatalog.models(for: harness)
     }

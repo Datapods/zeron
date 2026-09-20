@@ -29,6 +29,7 @@ final class WorkspaceStore {
     private(set) var presence: [String: Int64] = [:]  // deviceId → last beat ms
     private(set) var changeRequestSnapshots: [ChangeRequestWatchKey: CheckoutChangeRequestStatus] = [:]
     private(set) var connected = false
+    private(set) var retryAt: Date?
     /// True once ANY transport delivered server state this session (socket
     /// state frame or HTTPS pull). Drives the "connecting" spinner: with the
     /// pull-first bootstrap this flips in ~1 round trip, while the socket
@@ -229,6 +230,7 @@ final class WorkspaceStore {
         case .connected:
             let reconnected = !connected
             connected = true
+            retryAt = nil
             registryJoinedAt = nowMs()
             if reconnected {
                 restartChangeRequestStreams(resetUnsupported: true)
@@ -252,8 +254,9 @@ final class WorkspaceStore {
         case .presence(let device, let at):
             presence[device] = at
             presenceReceivedAt[device] = nowMs()
-        case .disconnected:
+        case .disconnected(let retryAfterMs):
             connected = false
+            retryAt = Date().addingTimeInterval(TimeInterval(retryAfterMs) / 1_000)
             registryJoinedAt = nil
             doc.markDisconnected()
         }

@@ -16,6 +16,48 @@ final class NetworkReliabilityTests: XCTestCase {
         let loaded = DocDisk.loadChat2(into: LoroDoc(), id: id)
         XCTAssertEqual(loaded?.cursor, 42)
         XCTAssertEqual(loaded?.verified, true)
+        XCTAssertEqual(loaded?.outbox.count, 0)
+    }
+
+    func testChat2Snapshot03RoundTripsOutboxAndSnapshot() throws {
+        let id = "outbox-\(UUID().uuidString)"
+        defer { try? FileManager.default.removeItem(at: DocDisk.chat2URL(for: id)) }
+        let doc = LoroDoc()
+        let map = doc.getMap(id: "test")
+        try map.insert(key: "value", v: "persisted")
+        doc.commit()
+        let outbox: [(batchId: String, bytes: Data)] = [
+            ("batch-a", Data([1, 2, 3])),
+            ("batch-b", Data([4, 5])),
+        ]
+        XCTAssertTrue(DocDisk.saveChat2(doc: doc, id: id, cursor: 42, verified: true,
+                                        outbox: outbox))
+
+        let restoredDoc = LoroDoc()
+        let loaded = try XCTUnwrap(DocDisk.loadChat2(into: restoredDoc, id: id))
+        XCTAssertEqual(loaded.cursor, 42)
+        XCTAssertTrue(loaded.verified)
+        XCTAssertEqual(loaded.outbox.map(\.batchId), outbox.map(\.batchId))
+        XCTAssertEqual(loaded.outbox.map(\.bytes), outbox.map(\.bytes))
+        XCTAssertEqual(restoredDoc.getDeepValue().mapValue?["test"]?.mapValue?["value"]?.stringValue,
+                       "persisted")
+    }
+
+    func testChat2Snapshot02LoadsWithEmptyOutbox() throws {
+        let id = "snap02-\(UUID().uuidString)"
+        defer { try? FileManager.default.removeItem(at: DocDisk.chat2URL(for: id)) }
+        let snapshot = try LoroDoc().export(mode: .snapshot)
+        var data = Data("C2SNAP02".utf8)
+        var cursor = UInt64(23).littleEndian
+        withUnsafeBytes(of: &cursor) { data.append(contentsOf: $0) }
+        data.append(1)
+        data.append(snapshot)
+        try data.write(to: DocDisk.chat2URL(for: id), options: .atomic)
+
+        let loaded = try XCTUnwrap(DocDisk.loadChat2(into: LoroDoc(), id: id))
+        XCTAssertEqual(loaded.cursor, 23)
+        XCTAssertTrue(loaded.verified)
+        XCTAssertTrue(loaded.outbox.isEmpty)
     }
 
     func testChat2SnapshotReadsLegacyUnverifiedFormat() throws {
@@ -32,6 +74,47 @@ final class NetworkReliabilityTests: XCTestCase {
         let loaded = DocDisk.loadChat2(into: LoroDoc(), id: id)
         XCTAssertEqual(loaded?.cursor, 17)
         XCTAssertEqual(loaded?.verified, false)
+        XCTAssertTrue(loaded?.outbox.isEmpty ?? false)
+    }
+
+    @MainActor
+    func testChat2RejectsEmptyOrUnreadableFrontier() {
+        let doc = LoroDoc()
+        XCTAssertFalse(SessionStore.containsFrontier(Data(), in: doc))
+        XCTAssertFalse(SessionStore.containsFrontier(Data([0xff, 0x00]), in: doc))
+    }
+
+    func testModelCacheRoundTrips() throws {
+        let deviceId = "cache-device-\(UUID().uuidString)"
+        let harness = "claude-code"
+        defer { try? FileManager.default.removeItem(at: DocDisk.modelsURL(deviceId: deviceId,
+                                                                           harness: harness)) }
+        let models = HarnessCatalog.models(for: harness)
+        XCTAssertTrue(DocDisk.saveModels(models, deviceId: deviceId, harness: harness))
+        XCTAssertEqual(DocDisk.loadModels(deviceId: deviceId, harness: harness), models)
+    }
+
+    @MainActor
+    func testRestartedSessionRetainsOutboxIdsAndRetiresThem() throws {
+        let id = "session-outbox-\(UUID().uuidString)"
+        let config = AppConfig(edgeURL: URL(string: "http://localhost:1")!, mode: .dev,
+                               userId: "u", orgId: "o", deviceId: "phone",
+                               deviceName: "phone", tokens: nil, devBearer: "u@o")
+        defer { try? FileManager.default.removeItem(at: DocDisk.chat2URL(for: id)) }
+        let doc = LoroDoc()
+        let outbox: [(batchId: String, bytes: Data)] = [
+            ("stable-a", Data([1])),
+            ("stable-b", Data([2])),
+        ]
+        XCTAssertTrue(DocDisk.saveChat2(doc: doc, id: id, cursor: 7, verified: true,
+                                        outbox: outbox))
+
+        let store = SessionStore(chatId: id, config: config)
+        store.start(holdDial: true)
+        XCTAssertEqual(store.outbox.map(\.batchId), ["stable-a", "stable-b"])
+        XCTAssertEqual(store.outbox.map(\.bytes), [Data([1]), Data([2])])
+        store.retirePush(batchId: "stable-a")
+        XCTAssertEqual(store.outbox.map(\.batchId), ["stable-b"])
     }
 
     // MARK: versionTriple (proto version_triple port)

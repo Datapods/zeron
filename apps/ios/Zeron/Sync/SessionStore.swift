@@ -51,6 +51,7 @@ final class SessionStore {
     /// the chat never parses markdown inside the first body pass.
     @ObservationIgnored let transcriptCache = TranscriptBuilderCache()
     private(set) var connected = false
+    private(set) var retryAt: Date?
     /// Client-minted ids of sends the host hasn't materialized yet.
     private(set) var pendingSends: [PendingSend] = []
     /// Messages typed while the agent was busy, in the order they will be sent
@@ -70,6 +71,7 @@ final class SessionStore {
     /// C2 rule), so content and cursor can never diverge.
     @ObservationIgnored private var cursor: UInt64 = 0
     @ObservationIgnored private var cursorVerified = false
+    @ObservationIgnored private(set) var outbox: [(batchId: String, bytes: Data)] = []
     private var chatRoom: ChatRoomClient?
     private var subscriptions: [Subscription] = []
     private let config: AppConfig
@@ -156,6 +158,7 @@ final class SessionStore {
         if let saved = DocDisk.loadChat2(into: doc, id: chatId) {
             cursor = saved.cursor
             cursorVerified = saved.verified
+            outbox = saved.outbox
             project()
         } else if DocDisk.legacySnapshotExists(id: chatId) {
             // M3 discard-and-adopt: this device's cached doc predates the
@@ -164,9 +167,9 @@ final class SessionStore {
             adoptLegacyCommands()
         }
         saver = DocSaver { [weak self] in
-            guard let self else { return }
-            DocDisk.saveChat2(doc: self.doc, id: self.chatId, cursor: self.cursor,
-                              verified: self.cursorVerified)
+            guard let self else { return false }
+            return DocDisk.saveChat2(doc: self.doc, id: self.chatId, cursor: self.cursor,
+                                     verified: self.cursorVerified, outbox: self.outbox)
         }
         // Subscription BEFORE any connect: every local commit lands in the
         // client when it exists; commits made earlier are covered by the
@@ -176,10 +179,12 @@ final class SessionStore {
             let bytes = Data(update)
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                if let room = self.chatRoom {
-                    Task { await room.enqueue(update: bytes) }
-                }
+                let batchId = UUID().uuidString.lowercased()
+                self.outbox.append((batchId: batchId, bytes: bytes))
                 self.saver?.poke()
+                if let room = self.chatRoom {
+                    Task { await room.enqueue(batchId: batchId, update: bytes) }
+                }
             }
         }
         subscriptions.append(localSub)
@@ -216,23 +221,8 @@ final class SessionStore {
         let delegate = ChatRoomClient.Delegate(
             cursor: { [weak self] in self?.cursor ?? 0 },
             containsFrontier: { [weak self] frontier in
-                // Deliberately NO empty-frontier shortcut (mirror of
-                // EngineChatSink::contains_frontier): an empty payload on a
-                // present checkpoint is unreadable provenance, not proof of
-                // emptiness — skipping made fresh readers park every row that
-                // depends on the chat's founding ops ("Add Tweets" incident,
-                // 2026-08-18). Empty fails the decode: NOT contained, fetch —
-                // always safe, never silently skips history.
-                guard let self, !frontier.isEmpty,
-                      let vv = try? VersionVector.decode(bytes: frontier) else { return false }
-                // A decoded-but-EMPTY version vector is a vacuous claim every
-                // doc "includes" — the actual poison, one representation
-                // deeper than zero-length bytes. Fetch.
-                guard !vv.toHashmap().isEmpty else {
-                    roomLog.info("chat2 \(self.chatId, privacy: .public): frontier decodes empty (vacuous); fetching checkpoint")
-                    return false
-                }
-                return self.doc.oplogVv().includesVv(other: vv)
+                guard let self else { return false }
+                return Self.containsFrontier(frontier, in: self.doc)
             },
             applyCheckpoint: { [weak self] bytes, seq in
                 guard let self,
@@ -290,6 +280,9 @@ final class SessionStore {
                 self.cursorVerified = verified
                 self.saver?.poke()
             },
+            retirePush: { [weak self] batchId in
+                self?.retirePush(batchId: batchId)
+            },
             event: { [weak self] event in self?.handle(event) }
         )
         let client = ChatRoomClient(
@@ -316,9 +309,35 @@ final class SessionStore {
         // the cursor moves and this never re-arms.
         if cursor == 0,
            let all = try? doc.export(mode: .updates(from: VersionVector())), !all.isEmpty {
-            Task { await client.enqueue(update: all) }
+            // The durable snapshot and outbox are written atomically. A
+            // cursor-zero full-log push therefore covers every restored
+            // outbox entry; replace them with one stable full-log batch rather
+            // than sending the same operations under multiple IDs.
+            let batchId = UUID().uuidString.lowercased()
+            outbox = [(batchId: batchId, bytes: all)]
+            saver?.poke()
+            Task { await client.enqueue(batchId: batchId, update: all) }
+        } else {
+            for push in outbox {
+                Task { await client.enqueue(batchId: push.batchId, update: push.bytes) }
+            }
         }
         Task { await client.start() }
+    }
+
+    func retirePush(batchId: String) {
+        let oldCount = outbox.count
+        outbox.removeAll { $0.batchId == batchId }
+        if outbox.count != oldCount {
+            saver?.poke()
+        }
+    }
+
+    static func containsFrontier(_ frontier: Data, in doc: LoroDoc) -> Bool {
+        guard !frontier.isEmpty,
+              let vv = try? VersionVector.decode(bytes: frontier),
+              !vv.toHashmap().isEmpty else { return false }
+        return doc.oplogVv().includesVv(other: vv)
     }
 
     /// Mine the retired s2 snapshot for OUR OWN still-pending commands and
@@ -387,9 +406,11 @@ final class SessionStore {
         switch event {
         case .connected:
             connected = true
+            retryAt = nil
             project()
-        case .disconnected:
+        case .disconnected(let retryAfterMs):
             connected = false
+            retryAt = Date().addingTimeInterval(TimeInterval(retryAfterMs) / 1_000)
         }
     }
 
