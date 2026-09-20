@@ -114,6 +114,14 @@ struct ComposerShell<Chips: View>: View {
                         }
                     }
                     .scrollClipDisabled(false)
+                    .mask {
+                        HStack(spacing: 0) {
+                            Rectangle()
+                            LinearGradient(colors: [.black, .clear],
+                                           startPoint: .leading, endPoint: .trailing)
+                                .frame(width: 24)
+                        }
+                    }
                     .frame(maxWidth: .infinity, alignment: .leading)
                     actionButton
                 }
