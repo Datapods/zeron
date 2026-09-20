@@ -127,6 +127,7 @@ final class TranscriptTableView: UITableView, UITableViewDataSource, UITableView
     private var updating = false
     private var settling = false
     private var animatingFollow = false
+    private var followAnimationGeneration: UInt64 = 0
     private var hasPositioned = false
     private var lastGeometry = TranscriptGeometry(contentHeight: 0, viewportHeight: 0, offset: 0, bottom: 0)
     private let runway = UIView()
@@ -200,7 +201,7 @@ final class TranscriptTableView: UITableView, UITableViewDataSource, UITableView
             verticalScrollIndicatorInsets.top = topInset
             let target = min(max(-topInset, logicalOffset - topInset),
                              max(-topInset, contentSize.height - bounds.height))
-            animatingFollow = false
+            cancelFollowAnimation()
             setContentOffset(CGPoint(x: 0, y: target), animated: false)
             layoutIfNeeded()
             if let anchor { restore(anchor) }
@@ -219,7 +220,7 @@ final class TranscriptTableView: UITableView, UITableViewDataSource, UITableView
         let target = min(max(-contentInset.top, contentOffset.y + step * max(44, viewportHeight - 80)),
                          max(-contentInset.top, contentSize.height - bounds.height))
         guard abs(target - contentOffset.y) > 0.5 else { return false }
-        animatingFollow = false
+        cancelFollowAnimation()
         follow.interactionEpoch &+= 1
         follow.pinned = false
         setContentOffset(CGPoint(x: 0, y: target), animated: false)
@@ -405,7 +406,7 @@ final class TranscriptTableView: UITableView, UITableViewDataSource, UITableView
         let visibleOffset = shrank ? max(anchor.offset, -max(0, rect.height - 44)) : anchor.offset
         let target = min(max(-contentInset.top, rect.minY - visibleOffset - contentInset.top), max(-contentInset.top, contentSize.height - bounds.height))
         guard abs(contentOffset.y - target) > 0.5 else { return }
-        animatingFollow = false
+        cancelFollowAnimation()
         setContentOffset(CGPoint(x: 0, y: target), animated: false)
     }
 
@@ -425,10 +426,15 @@ final class TranscriptTableView: UITableView, UITableViewDataSource, UITableView
     private func alignBottom(animated: Bool) {
         let target = tailTarget
         guard abs(contentOffset.y - target) > 0.5 else {
-            animatingFollow = false
+            cancelFollowAnimation()
             return
         }
-        animatingFollow = animated
+        if animated {
+            animatingFollow = true
+            scheduleFollowAnimationWatchdog()
+        } else {
+            cancelFollowAnimation()
+        }
         setContentOffset(CGPoint(x: 0, y: target), animated: animated)
     }
 
@@ -437,7 +443,7 @@ final class TranscriptTableView: UITableView, UITableViewDataSource, UITableView
         setContentOffset(contentOffset, animated: false)
         follow.userScrolling = false
         follow.userDragging = false
-        animatingFollow = false
+        cancelFollowAnimation()
         goToLatest(animated: animated)
     }
 
@@ -453,10 +459,40 @@ final class TranscriptTableView: UITableView, UITableViewDataSource, UITableView
             alignBottom(animated: false)
             settling = false
         } else {
-            animatingFollow = true
-            layoutIfNeeded()
-            updateRunway()
+            let distance = tailTarget - contentOffset.y
+            if distance > 2 * bounds.height {
+                settling = true
+                scrollToRow(at: IndexPath(row: rows.count - 1, section: 0),
+                            at: .bottom, animated: false)
+                layoutIfNeeded()
+                updateRunway()
+                let target = max(-contentInset.top, tailTarget - bounds.height)
+                setContentOffset(CGPoint(x: 0, y: target), animated: false)
+                layoutIfNeeded()
+                updateRunway()
+                settling = false
+            }
             alignBottom(animated: true)
+        }
+    }
+
+    private func cancelFollowAnimation() {
+        followAnimationGeneration &+= 1
+        animatingFollow = false
+    }
+
+    private func scheduleFollowAnimationWatchdog() {
+        followAnimationGeneration &+= 1
+        let generation = followAnimationGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(450)) { [weak self] in
+            guard let self,
+                  self.followAnimationGeneration == generation,
+                  self.animatingFollow,
+                  self.follow.pinned,
+                  !self.userOwnsScroll,
+                  self.window != nil else { return }
+            self.animatingFollow = false
+            self.goToLatest(animated: false)
         }
     }
 
@@ -511,7 +547,7 @@ final class TranscriptTableView: UITableView, UITableViewDataSource, UITableView
     }
 
     func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
-        animatingFollow = false
+        cancelFollowAnimation()
         follow.interactionEpoch &+= 1
         follow.userScrolling = true
         follow.userDragging = true
@@ -536,7 +572,7 @@ final class TranscriptTableView: UITableView, UITableViewDataSource, UITableView
     }
 
     func scrollViewDidEndScrollingAnimation(_ scrollView: UIScrollView) {
-        animatingFollow = false
+        cancelFollowAnimation()
         if follow.pinned { goToLatest(animated: false) }
     }
 }
