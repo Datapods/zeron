@@ -318,8 +318,11 @@ final class SessionStore {
             saver?.poke()
             Task { await client.enqueue(batchId: batchId, update: all) }
         } else {
-            for push in outbox {
-                Task { await client.enqueue(batchId: push.batchId, update: push.bytes) }
+            let restored = outbox
+            Task {
+                for push in restored {
+                    await client.enqueue(batchId: push.batchId, update: push.bytes)
+                }
             }
         }
         Task { await client.start() }
