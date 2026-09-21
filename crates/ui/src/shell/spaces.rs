@@ -1847,7 +1847,7 @@ pub(super) struct SidebarViewMenu {
     submenu_active: Option<usize>,
     submenu_bounds: Option<gpui::Bounds<gpui::Pixels>>,
     submenu_on_left: bool,
-    hover_task: Option<Task<()>>,
+    hover_intent: popover::HoverIntent<usize>,
     /// Keyboard cursor. Mouse-opened menus start without one so the persisted
     /// radio/check state is the only selection signal until an arrow key is
     /// pressed.
@@ -2985,6 +2985,9 @@ impl Shell {
     }
 
     fn close_sidebar_view_menu(&mut self, cx: &mut Context<Self>) {
+        if let Some(menu) = self.sidebar_view_menu.open_mut() {
+            menu.hover_intent.reset();
+        }
         if self.sidebar_view_menu.begin_close() {
             popover::reap_popup(cx, |shell: &mut Self| &mut shell.sidebar_view_menu);
             cx.notify();
@@ -2999,7 +3002,7 @@ impl Shell {
             submenu_active: None,
             submenu_bounds: None,
             submenu_on_left: false,
-            hover_task: None,
+            hover_intent: popover::HoverIntent::default(),
             active: None,
             focus: focus.clone(),
         });
@@ -3008,6 +3011,9 @@ impl Shell {
     }
 
     fn activate_sidebar_view_row(&mut self, row: SidebarViewRow, cx: &mut Context<Self>) {
+        if let Some(menu) = self.sidebar_view_menu.open_mut() {
+            menu.hover_intent.cancel();
+        }
         self.cancel_sidebar_session_transfer(cx);
         self.cancel_pinned_session_drag(cx);
         match row {
@@ -3051,7 +3057,7 @@ impl Shell {
                 menu.submenu = None;
                 menu.submenu_active = None;
                 menu.submenu_bounds = None;
-                menu.hover_task = None;
+                menu.hover_intent.cancel();
             }
         }
         cx.notify();
@@ -3059,12 +3065,63 @@ impl Shell {
 
     fn open_sidebar_view_submenu(&mut self, group: usize, keyboard: bool, cx: &mut Context<Self>) {
         if let Some(menu) = self.sidebar_view_menu.open_mut() {
-            menu.hover_task = None;
+            menu.hover_intent.reset();
             menu.active = Some(group);
-            menu.submenu = Some(group);
+            menu.submenu = (group < SIDEBAR_VIEW_GROUPS.len()).then_some(group);
             menu.submenu_active = keyboard.then_some(0);
             menu.submenu_bounds = None;
             cx.notify();
+        }
+    }
+
+    fn hover_sidebar_view_group(
+        &mut self,
+        group: usize,
+        pointer: gpui::Point<gpui::Pixels>,
+        moved: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(menu) = self.sidebar_view_menu.open_mut() else {
+            return;
+        };
+        let action = if moved {
+            menu.hover_intent.moved(
+                menu.submenu.as_ref(),
+                &group,
+                pointer,
+                menu.submenu_bounds,
+                menu.submenu_on_left,
+            )
+        } else {
+            menu.hover_intent.enter(
+                menu.submenu.as_ref(),
+                &group,
+                pointer,
+                menu.submenu_bounds,
+                menu.submenu_on_left,
+            )
+        };
+        match action {
+            popover::HoverAction::None => {}
+            popover::HoverAction::Open => {
+                self.open_sidebar_view_submenu(group, false, cx);
+                if let Some(menu) = self.sidebar_view_menu.open_mut() {
+                    menu.hover_intent.record_origin(pointer);
+                }
+            }
+            popover::HoverAction::Defer => {
+                let source = menu.submenu;
+                menu.hover_intent.defer(cx, move |this, cx| {
+                    if this.sidebar_view_menu.open_mut().is_some_and(|menu| {
+                        menu.submenu == source && menu.hover_intent.pending() == Some(&group)
+                    }) {
+                        this.open_sidebar_view_submenu(group, false, cx);
+                        if let Some(menu) = this.sidebar_view_menu.open_mut() {
+                            menu.hover_intent.record_origin(pointer);
+                        }
+                    }
+                });
+            }
         }
     }
 
@@ -3072,7 +3129,7 @@ impl Shell {
         let Some(menu) = self.sidebar_view_menu.open_mut() else {
             return;
         };
-        menu.hover_task = None;
+        menu.hover_intent.cancel();
         let key = match popover::classify_key(
             event.keystroke.key.as_str(),
             event.keystroke.modifiers.platform,
@@ -3194,6 +3251,7 @@ impl Shell {
             }
             let open = submenu == Some(group);
             let entity = cx.entity().downgrade();
+            let exit_entity = cx.entity().downgrade();
             let mut trigger = popover::menu_row_nav(
                 theme,
                 open,
@@ -3205,20 +3263,16 @@ impl Shell {
             .h(px(30.0))
             .py(px(0.0))
             .on_click(cx.listener(move |this, _, _, cx| {
-                if this
-                    .sidebar_view_menu
-                    .get()
-                    .is_some_and(|m| m.submenu == Some(group))
-                {
-                    if let Some(menu) = this.sidebar_view_menu.open_mut() {
-                        menu.submenu = None;
-                        menu.submenu_bounds = None;
-                        menu.hover_task = None;
-                    }
-                    cx.notify();
-                } else {
-                    this.open_sidebar_view_submenu(group, false, cx);
+                // Match model settings: hover opens; clicking dismisses, including
+                // a sibling crossed during hover grace, without delayed reopening.
+                if let Some(menu) = this.sidebar_view_menu.open_mut() {
+                    menu.active = Some(group);
+                    menu.submenu = None;
+                    menu.submenu_active = None;
+                    menu.submenu_bounds = None;
+                    menu.hover_intent.reset();
                 }
+                cx.notify();
                 cx.stop_propagation();
             }))
             .child(div().flex_1().child(*label))
@@ -3247,7 +3301,37 @@ impl Shell {
                             }
                         });
                     },
-                    |_, _, _, _| {},
+                    move |trigger, _, window, _| {
+                        if !open {
+                            return;
+                        }
+                        window.on_mouse_event(move |event: &gpui::MouseMoveEvent, phase, _, cx| {
+                            if phase != gpui::DispatchPhase::Bubble {
+                                return;
+                            }
+                            let _ = exit_entity.update(cx, |this, cx| {
+                                let Some(menu) = this.sidebar_view_menu.open_mut() else {
+                                    return;
+                                };
+                                if menu.submenu != Some(group)
+                                    || menu.hover_intent.contains_pointer(
+                                        trigger,
+                                        menu.submenu_bounds,
+                                        event.position,
+                                        menu.submenu_on_left,
+                                    )
+                                {
+                                    return;
+                                }
+                                menu.hover_intent.reset();
+                                menu.submenu = None;
+                                menu.submenu_bounds = None;
+                                menu.submenu_active = None;
+                                menu.active = None;
+                                cx.notify();
+                            });
+                        });
+                    },
                 )
                 .absolute()
                 .inset_0(),
@@ -3316,65 +3400,73 @@ impl Shell {
             groups.push(
                 div()
                     .id(("sidebar-view-hover", group))
-                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                        let Some(menu) = this.sidebar_view_menu.open_mut() else {
-                            return;
-                        };
-                        menu.hover_task = None;
-                        if !*hovered || menu.submenu == Some(group) {
-                            return;
-                        }
-                        if menu.submenu.is_none() {
-                            this.open_sidebar_view_submenu(group, false, cx);
-                        } else {
-                            // Let diagonal pointer travel cross siblings on the way to the child.
-                            menu.hover_task = Some(cx.spawn(async move |this, cx| {
-                                cx.background_executor()
-                                    .timer(std::time::Duration::from_millis(250))
-                                    .await;
-                                let _ = this.update(cx, |this, cx| {
-                                    this.open_sidebar_view_submenu(group, false, cx)
-                                });
-                            }));
+                    .on_hover(cx.listener(move |this, hovered: &bool, window, cx| {
+                        if *hovered {
+                            this.hover_sidebar_view_group(
+                                group,
+                                window.mouse_position(),
+                                false,
+                                cx,
+                            );
+                        } else if let Some(menu) = this.sidebar_view_menu.open_mut() {
+                            menu.hover_intent.leave(&group);
                         }
                     }))
+                    .on_mouse_move(
+                        cx.listener(move |this, event: &gpui::MouseMoveEvent, _, cx| {
+                            this.hover_sidebar_view_group(group, event.position, true, cx);
+                        }),
+                    )
                     .child(trigger)
                     .into_any_element(),
             );
         }
         groups.push(popover::menu_separator().into_any_element());
         groups.push(
-            popover::menu_row_nav(
-                theme,
-                false,
-                active == Some(SIDEBAR_VIEW_GROUPS.len()),
-                "sidebar-view-compact",
-            )
-            .id("sidebar-view-compact")
-            .h(px(30.0))
-            .py(px(0.0))
-            .on_mouse_move(cx.listener(|this, _, _, cx| {
-                if let Some(menu) = this.sidebar_view_menu.open_mut() {
-                    if menu.submenu.is_some() || menu.active != Some(SIDEBAR_VIEW_GROUPS.len()) {
-                        menu.hover_task = None;
-                        menu.submenu = None;
-                        menu.submenu_active = None;
-                        menu.submenu_bounds = None;
-                        menu.active = Some(SIDEBAR_VIEW_GROUPS.len());
-                        cx.notify();
+            div()
+                .id("sidebar-view-compact-hover")
+                .on_hover(cx.listener(|this, hovered: &bool, window, cx| {
+                    if *hovered {
+                        this.hover_sidebar_view_group(
+                            SIDEBAR_VIEW_GROUPS.len(),
+                            window.mouse_position(),
+                            false,
+                            cx,
+                        );
+                    } else if let Some(menu) = this.sidebar_view_menu.open_mut() {
+                        menu.hover_intent.leave(&SIDEBAR_VIEW_GROUPS.len());
                     }
-                }
-            }))
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.activate_sidebar_view_row(SidebarViewRow::Compact, cx);
-                cx.stop_propagation();
-            }))
-            .child(div().flex_1().child("Compact"))
-            .child(crate::settings::widgets::toggle_switch(
-                theme,
-                self.settings.sidebar_compact,
-            ))
-            .into_any_element(),
+                }))
+                .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
+                    this.hover_sidebar_view_group(
+                        SIDEBAR_VIEW_GROUPS.len(),
+                        event.position,
+                        true,
+                        cx,
+                    );
+                }))
+                .child(
+                    popover::menu_row_nav(
+                        theme,
+                        false,
+                        active == Some(SIDEBAR_VIEW_GROUPS.len()),
+                        "sidebar-view-compact",
+                    )
+                    .id("sidebar-view-compact")
+                    .h(px(30.0))
+                    .py(px(0.0))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.open_sidebar_view_submenu(SIDEBAR_VIEW_GROUPS.len(), false, cx);
+                        this.activate_sidebar_view_row(SidebarViewRow::Compact, cx);
+                        cx.stop_propagation();
+                    }))
+                    .child(div().flex_1().child("Compact"))
+                    .child(crate::settings::widgets::toggle_switch(
+                        theme,
+                        self.settings.sidebar_compact,
+                    )),
+                )
+                .into_any_element(),
         );
         popover::popover_card(theme)
             .w(px(self.settings.sidebar_width - 2.0 * Theme::SPACE_SM))
