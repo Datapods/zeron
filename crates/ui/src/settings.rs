@@ -36,6 +36,20 @@ pub const SIDEBAR_DEFAULT: f32 = 256.0;
 pub const FILES_PANEL_DEFAULT: f32 = 286.0;
 pub const FILES_PANEL_MIN: f32 = 220.0;
 pub const FILES_PANEL_MAX: f32 = 440.0;
+/// The explorer footer (Subagents / Chats) height budget, dragged at its
+/// seam with the tree.
+pub const FILES_SECTIONS_DEFAULT: f32 = 300.0;
+pub const FILES_SECTIONS_MIN: f32 = 120.0;
+pub const FILES_SECTIONS_MAX: f32 = 720.0;
+
+pub fn clamp_files_sections_height(height: f32) -> f32 {
+    clamp_or(
+        height,
+        FILES_SECTIONS_MIN,
+        FILES_SECTIONS_MAX,
+        FILES_SECTIONS_DEFAULT,
+    )
+}
 
 /// Surface pane floor and default (px). Runtime sizing also reserves space
 /// for the conversation and any docked file explorer.
@@ -678,6 +692,8 @@ pub struct UiSettings {
     /// the foreground case).
     pub notifications_background_only: bool,
     pub files_panel_width: f32,
+    /// Height budget of the explorer's Subagents / Chats footer.
+    pub files_sections_height: f32,
     pub right_pane_width: f32,
     /// Legacy: panel *open* flags are session-scoped in-memory state now
     /// (`shell::SessionPanels`, zeron `sessionPanels` parity). Kept for file
@@ -787,6 +803,7 @@ impl Default for UiSettings {
             notifications_enabled: true,
             notifications_background_only: true,
             files_panel_width: FILES_PANEL_DEFAULT,
+            files_sections_height: FILES_SECTIONS_DEFAULT,
             right_pane_width: RIGHT_PANE_DEFAULT,
             right_pane_open: false,
             terminal_height: TERMINAL_DEFAULT_HEIGHT,
@@ -1357,6 +1374,7 @@ impl UiSettings {
             FILES_PANEL_MAX,
             FILES_PANEL_DEFAULT,
         );
+        self.files_sections_height = clamp_files_sections_height(self.files_sections_height);
         self.right_pane_width = min_or(self.right_pane_width, RIGHT_PANE_MIN, RIGHT_PANE_DEFAULT);
         self.terminal_height = clamp_or(
             self.terminal_height,
@@ -2060,6 +2078,7 @@ mod tests {
             notifications_enabled: false,
             notifications_background_only: false,
             files_panel_width: 310.0,
+            files_sections_height: 280.0,
             right_pane_width: 700.0,
             right_pane_open: true,
             terminal_height: 320.0,

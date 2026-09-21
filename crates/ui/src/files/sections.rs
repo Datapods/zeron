@@ -5,16 +5,22 @@
 //! server). Rows borrow the left sidebar's compact session row — 29px, status
 //! glyph, title, time — minus the harness, project and device icons, which
 //! say nothing here (every row shares the parent's context). Clicking a row
-//! opens it in the right pane's surface host; the section chrome animates
-//! with the same collapse motion as the sidebar's disclosures.
+//! opens it in the right pane's surface host; the Chats header carries "+"
+//! and fork beside its caret; the section chrome animates with the same
+//! collapse motion as the sidebar's disclosures.
+//!
+//! The footer is a pane of its own: its height is dragged at the seam with
+//! the tree and persisted (`UiSettings::files_sections_height`), open
+//! sections share that height and scroll, and like the sidebar's Archived
+//! shelf each shows ten rows before a "Show more" row pages by 25.
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
 use chrono::{DateTime, Utc};
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, Context, EntityId, MouseButton, SharedString, div,
-    prelude::*, px,
+    Animation, AnimationExt as _, AnyElement, Context, EntityId, MouseButton, SharedString, Window,
+    div, prelude::*, px,
 };
 use zeron_doc::{MessagePart, SubagentStatus};
 use zeron_proto::{Chat, ChatIndicator};
@@ -30,10 +36,19 @@ const SECTION_HEADER_HEIGHT: f32 = 28.0;
 const SECTION_BODY_INSET: f32 = 4.0;
 const ROW_HEIGHT: f32 = 29.0;
 const ROW_GAP: f32 = 2.0;
-const EMPTY_ROW_HEIGHT: f32 = 24.0;
-/// Rows an open section shows before it scrolls, so a busy orchestrator
-/// never pushes the tree out of its own pane.
-const MAX_VISIBLE_ROWS: usize = 6;
+/// Empty-state copy: two 16px lines' worth so the sentence can wrap in a
+/// narrow explorer instead of clipping.
+const EMPTY_LINE_HEIGHT: f32 = 36.0;
+/// The Chats empty state's action row (Fork / New side chat pills).
+const EMPTY_ACTIONS_HEIGHT: f32 = 34.0;
+/// Rows a section shows before "Show more" pages it, and the page size —
+/// the sidebar's Archived shelf numbers.
+const INITIAL_ROWS: usize = 10;
+const PAGE_ROWS: usize = 25;
+const FOOTER_PAD_TOP: f32 = 4.0;
+const FOOTER_PAD_BOTTOM: f32 = 6.0;
+/// Drag hitbox straddling the seam with the tree.
+const RESIZE_HITBOX: f32 = 8.0;
 const TWEEN_GRACE: std::time::Duration = std::time::Duration::from_millis(120);
 
 /// Which footer section a motion or toggle addresses.
@@ -57,12 +72,16 @@ impl Section {
             Section::Chats => "Chats",
         }
     }
+}
 
-    fn empty_copy(self) -> &'static str {
-        match self {
-            Section::Subagents => "No subagents yet",
-            Section::Chats => "No side chats yet",
-        }
+/// Drag payload for the seam between the tree and the footer.
+pub(super) struct SectionsResize;
+
+struct DragGhost;
+
+impl gpui::Render for DragGhost {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
     }
 }
 
@@ -98,6 +117,12 @@ impl DisclosureMotion {
 pub(super) struct ExplorerSections {
     open: HashMap<Section, bool>,
     motion: HashMap<Section, DisclosureMotion>,
+    /// Rows revealed per section ("Show more" pages this up).
+    shown: HashMap<Section, usize>,
+    /// The footer's height budget when its content wants more (persisted by
+    /// the shell); shorter content shrinks the footer to fit.
+    pub(super) height: f32,
+    resizing: bool,
     /// Hash of what the footer would draw, so the state observer only
     /// re-renders the explorer when a section's contents actually changed —
     /// not on every streamed transcript delta.
@@ -111,6 +136,9 @@ impl Default for ExplorerSections {
                 .into_iter()
                 .collect(),
             motion: HashMap::new(),
+            shown: HashMap::new(),
+            height: crate::settings::FILES_SECTIONS_DEFAULT,
+            resizing: false,
             fingerprint: 0,
         }
     }
@@ -119,6 +147,14 @@ impl Default for ExplorerSections {
 impl ExplorerSections {
     pub(super) fn is_open(&self, section: Section) -> bool {
         self.open.get(&section).copied().unwrap_or(true)
+    }
+
+    fn shown(&self, section: Section) -> usize {
+        self.shown
+            .get(&section)
+            .copied()
+            .unwrap_or(INITIAL_ROWS)
+            .max(INITIAL_ROWS)
     }
 
     fn toggle(&mut self, section: Section, resting: f32, target: f32) {
@@ -281,12 +317,43 @@ pub(super) fn fingerprint(state: &AppState, chat_id: &str, now: DateTime<Utc>) -
     hasher.finish()
 }
 
-fn body_height(rows: usize) -> f32 {
-    if rows == 0 {
-        return SECTION_BODY_INSET + EMPTY_ROW_HEIGHT;
+/// The height a section body wants for `count` rows with `shown` revealed:
+/// inset, the visible rows, and a "Show more" row while more remain. Empty
+/// sections want their empty-state copy (Chats adds its action row).
+pub(super) fn content_height(section: Section, count: usize, shown: usize) -> f32 {
+    if count == 0 {
+        return SECTION_BODY_INSET
+            + EMPTY_LINE_HEIGHT
+            + match section {
+                Section::Chats => EMPTY_ACTIONS_HEIGHT,
+                Section::Subagents => 0.0,
+            };
     }
-    let shown = rows.min(MAX_VISIBLE_ROWS);
-    SECTION_BODY_INSET + shown as f32 * ROW_HEIGHT + shown.saturating_sub(1) as f32 * ROW_GAP
+    let visible = count.min(shown);
+    let more = if count > shown { 1 } else { 0 };
+    let slots = visible + more;
+    SECTION_BODY_INSET + slots as f32 * ROW_HEIGHT + slots.saturating_sub(1) as f32 * ROW_GAP
+}
+
+/// Split the footer's body budget between two open sections: each may take
+/// what it wants, and a short one hands its slack to the other. Closed
+/// sections get 0. Pure.
+pub(super) fn body_budget(budget: f32, wants: [f32; 2], open: [bool; 2]) -> [f32; 2] {
+    let budget = budget.max(0.0);
+    let want = |i: usize| if open[i] { wants[i] } else { 0.0 };
+    let (a, b) = (want(0), want(1));
+    if a + b <= budget {
+        return [a, b];
+    }
+    let half = budget / 2.0;
+    let first = a.min(budget - b.min(half));
+    let second = b.min(budget - first);
+    [first, second]
+}
+
+/// The footer's chrome outside the bodies: padding and the two headers.
+fn chrome_height() -> f32 {
+    FOOTER_PAD_TOP + FOOTER_PAD_BOTTOM + 2.0 * SECTION_HEADER_HEIGHT
 }
 
 impl FilesSurface {
@@ -299,6 +366,34 @@ impl FilesSurface {
         }
     }
 
+    /// The shell hands the persisted footer height in after construction.
+    pub fn set_sections_height(&mut self, height: f32, cx: &mut Context<Self>) {
+        let height = crate::settings::clamp_files_sections_height(height);
+        if (self.sections.height - height).abs() > f32::EPSILON {
+            self.sections.height = height;
+            cx.notify();
+        }
+    }
+
+    /// Drag on the seam: the footer's bottom is the surface's bottom, so its
+    /// height is the distance from the pointer to the window's bottom edge.
+    pub(super) fn on_sections_drag(
+        &mut self,
+        event: &gpui::DragMoveEvent<SectionsResize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let requested =
+            f32::from(window.viewport_size().height) - f32::from(event.event.position.y);
+        let height = crate::settings::clamp_files_sections_height(requested);
+        self.sections.resizing = true;
+        if (self.sections.height - height).abs() > 0.5 {
+            self.sections.height = height;
+            cx.emit(FilesEvent::SectionsHeightChanged(height));
+        }
+        cx.notify();
+    }
+
     pub(super) fn render_sections(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let now = Utc::now();
         let (subagents, chats) = {
@@ -309,11 +404,31 @@ impl FilesSurface {
             )
         };
         self.sections.fingerprint = fingerprint(self.state.read(cx), &self.chat_id, now);
+        let wants = [
+            content_height(
+                Section::Subagents,
+                subagents.len(),
+                self.sections.shown(Section::Subagents),
+            ),
+            content_height(
+                Section::Chats,
+                chats.len(),
+                self.sections.shown(Section::Chats),
+            ),
+        ];
+        let open = [
+            self.sections.is_open(Section::Subagents),
+            self.sections.is_open(Section::Chats),
+        ];
+        let budget = self.sections.height - chrome_height();
+        let heights = body_budget(budget, wants, open);
         let view = cx.entity_id();
         let subagent_body = self.render_subagent_rows(&subagents, view, theme, cx);
         let chat_body = self.render_chat_rows(&chats, theme, cx);
+        let chats_actions = self.render_chats_header_actions(theme, cx);
         div()
             .id("files-sections")
+            .relative()
             .flex_none()
             .w_full()
             .flex()
@@ -321,11 +436,14 @@ impl FilesSurface {
             .border_t_1()
             .border_color(theme.border)
             .px(px(6.0))
-            .pt(px(4.0))
-            .pb(px(6.0))
+            .pt(px(FOOTER_PAD_TOP))
+            .pb(px(FOOTER_PAD_BOTTOM))
+            .child(self.render_resize_seam(theme, cx))
             .child(self.render_section(
                 Section::Subagents,
                 subagents.len(),
+                wants[0],
+                heights[0],
                 None,
                 subagent_body,
                 theme,
@@ -334,7 +452,9 @@ impl FilesSurface {
             .child(self.render_section(
                 Section::Chats,
                 chats.len(),
-                Some(self.render_new_chat_button(theme, cx)),
+                wants[1],
+                heights[1],
+                Some(chats_actions),
                 chat_body,
                 theme,
                 cx,
@@ -342,47 +462,115 @@ impl FilesSurface {
             .into_any_element()
     }
 
-    /// The "+" on the Chats header: a fresh side chat of the active chat,
-    /// opened in the right pane ready for its first message.
-    fn render_new_chat_button(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    /// The drag seam over the footer's top hairline: hover and drag light
+    /// the line up, the sidebar/pane seam treatment in miniature.
+    fn render_resize_seam(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let active = self.sections.resizing;
         div()
-            .id("files-sections-new-chat")
-            .role(gpui::Role::Button)
-            .aria_label("New side chat")
-            .flex_none()
-            .size(px(20.0))
-            .rounded(px(5.0))
+            .id("files-sections-resize")
+            .group("files-sections-seam")
+            .absolute()
+            .top(px(-RESIZE_HITBOX / 2.0))
+            .left_0()
+            .right_0()
+            .h(px(RESIZE_HITBOX))
+            .occlude()
+            .cursor_row_resize()
             .flex()
-            .items_center()
+            .flex_col()
             .justify_center()
-            .cursor_pointer()
-            .text_color(theme.text_muted.opacity(0.6))
-            .hover(|s| s.bg(crate::theme::wash(0.09)).text_color(theme.text_muted))
+            .child(
+                div()
+                    .h(px(1.0))
+                    .w_full()
+                    .bg(if active {
+                        theme.border_strong
+                    } else {
+                        theme.border_strong.opacity(0.0)
+                    })
+                    .group_hover("files-sections-seam", |s| s.bg(theme.border_strong)),
+            )
             .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
-            .on_click(cx.listener(|_, _, _, cx| {
-                cx.stop_propagation();
-                cx.emit(FilesEvent::NewChildChat);
-            }))
-            .child(icon(icons::PLUS).size(px(12.0)))
+            .on_drag(SectionsResize, |_, _, _, cx| cx.new(|_| DragGhost))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.sections.resizing = false;
+                    cx.notify();
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.sections.resizing = false;
+                    cx.notify();
+                }),
+            )
             .into_any_element()
     }
 
+    /// "+" and fork beside the Chats caret: a fresh side chat of the active
+    /// chat, or a fork of it through its latest completed response.
+    fn render_chats_header_actions(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .flex_none()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(2.0))
+            .child(
+                header_action(
+                    "files-sections-new-chat",
+                    icons::PLUS,
+                    "New side chat",
+                    theme,
+                )
+                .on_click(cx.listener(|_, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.emit(FilesEvent::NewChildChat);
+                })),
+            )
+            .child(
+                header_action(
+                    "files-sections-fork",
+                    icons::GIT_BRANCH,
+                    "Fork this chat",
+                    theme,
+                )
+                .on_click(cx.listener(|_, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.emit(FilesEvent::ForkChat);
+                })),
+            )
+            .into_any_element()
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn render_section(
         &mut self,
         section: Section,
         count: usize,
-        action: Option<AnyElement>,
+        wanted: f32,
+        height: f32,
+        actions: Option<AnyElement>,
         body: AnyElement,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let open = self.sections.is_open(section);
-        let full_height = body_height(count);
         // The collapsed header carries the count; open, the rows speak.
         let label: SharedString = if open || count == 0 {
             section.label().into()
         } else {
             format!("{} ({count})", section.label()).into()
+        };
+        // Toggling animates between 0 and the height this section gets from
+        // the budget (the body scrolls inside it); a closed section reopens
+        // to what it wants within the whole budget.
+        let full = if open {
+            height
+        } else {
+            wanted.min(self.sections.height - chrome_height()).max(0.0)
         };
         let header = div()
             .id(SharedString::from(format!(
@@ -395,23 +583,22 @@ impl FilesSurface {
                 if open { "Collapse" } else { "Expand" },
                 section.label()
             )))
+            .flex_none()
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(8.0))
+            .gap(px(6.0))
             .h(px(SECTION_HEADER_HEIGHT))
-            .px(px(Theme::SPACE_SM))
+            .pl(px(Theme::SPACE_SM))
+            .pr(px(4.0))
             .rounded(px(6.0))
             .cursor_pointer()
             .hover(|s| s.bg(crate::theme::wash(0.04)))
             .on_click(cx.listener(move |this, _, _, cx| {
-                // Open → close runs from the full body height to 0, and back.
+                // Open → close runs from the painted body height to 0, and
+                // back up to what the budget allows.
                 let was_open = this.sections.is_open(section);
-                let (resting, target) = if was_open {
-                    (full_height, 0.0)
-                } else {
-                    (0.0, full_height)
-                };
+                let (resting, target) = if was_open { (full, 0.0) } else { (0.0, full) };
                 this.sections.toggle(section, resting, target);
                 cx.notify();
             }))
@@ -425,13 +612,14 @@ impl FilesSurface {
                     .text_color(theme.text_muted.opacity(0.5))
                     .child(label),
             )
-            .children(action)
+            .children(actions)
             .child(self.render_chevron(section, open, theme));
         div()
+            .flex_none()
             .flex()
             .flex_col()
             .child(header)
-            .child(self.render_disclosure_body(section, open, full_height, body))
+            .child(self.render_disclosure_body(section, open, height, body))
             .into_any_element()
     }
 
@@ -439,7 +627,12 @@ impl FilesSurface {
         let chevron = icon(icons::ALT_ARROW_RIGHT)
             .size(px(12.0))
             .text_color(theme.text_muted.opacity(0.5));
-        let frame = div().flex_none().size(px(12.0));
+        let frame = div()
+            .flex_none()
+            .size(px(20.0))
+            .flex()
+            .items_center()
+            .justify_center();
         if let Some(tween) = self.sections.live_motion(section) {
             let denominator = tween.from.max(tween.to).max(1.0);
             let from = (tween.from / denominator).clamp(0.0, 1.0);
@@ -476,15 +669,15 @@ impl FilesSurface {
         &self,
         section: Section,
         open: bool,
-        full_height: f32,
+        height: f32,
         content: AnyElement,
     ) -> AnyElement {
-        let target = if open { full_height } else { 0.0 };
+        let target = if open { height } else { 0.0 };
         let frame = div().w_full().flex_none().overflow_hidden().child(content);
         let Some(tween) = self.sections.live_motion(section) else {
             return frame.h(px(target)).into_any_element();
         };
-        let denominator = full_height.max(1.0);
+        let denominator = tween.from.max(tween.to).max(1.0);
         frame
             .with_animation(
                 SharedString::from(format!(
@@ -505,6 +698,39 @@ impl FilesSurface {
             .into_any_element()
     }
 
+    fn render_show_more(
+        &self,
+        section: Section,
+        remaining: usize,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .id(SharedString::from(format!(
+                "files-section-{}-more",
+                section.key()
+            )))
+            .role(gpui::Role::Button)
+            .flex_none()
+            .h(px(ROW_HEIGHT))
+            .flex()
+            .items_center()
+            .px(px(Theme::SPACE_SM))
+            .rounded(px(8.0))
+            .cursor_pointer()
+            .text_size(crate::typography::ui_rems(12.0))
+            .text_color(theme.text_muted.opacity(0.7))
+            .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text_muted))
+            .child(format!("Show more ({remaining})"))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                let shown = this.sections.shown(section) + PAGE_ROWS;
+                this.sections.shown.insert(section, shown);
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
     fn render_subagent_rows(
         &self,
         rows: &[SubagentRow],
@@ -513,11 +739,16 @@ impl FilesSurface {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         if rows.is_empty() {
-            return empty_row(Section::Subagents, theme);
+            return empty_state(
+                "Subagents will appear here when they are created",
+                None,
+                theme,
+            );
         }
         let now = Utc::now();
+        let shown = self.sections.shown(Section::Subagents);
         let mut list = row_list("files-subagent-rows");
-        for row in rows {
+        for row in rows.iter().take(shown) {
             let glyph = status_glyph(
                 format!("files-subagent-{}", row.doc_id),
                 row.indicator(),
@@ -545,6 +776,14 @@ impl FilesSurface {
                     )),
             );
         }
+        if rows.len() > shown {
+            list = list.child(self.render_show_more(
+                Section::Subagents,
+                rows.len() - shown,
+                theme,
+                cx,
+            ));
+        }
         list.into_any_element()
     }
 
@@ -555,11 +794,47 @@ impl FilesSurface {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         if rows.is_empty() {
-            return empty_row(Section::Chats, theme);
+            let actions = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.0))
+                .h(px(EMPTY_ACTIONS_HEIGHT))
+                .child(
+                    pill_button(
+                        "files-sections-empty-fork",
+                        icons::GIT_BRANCH,
+                        "Fork",
+                        theme,
+                    )
+                    .on_click(cx.listener(|_, _, _, cx| {
+                        cx.stop_propagation();
+                        cx.emit(FilesEvent::ForkChat);
+                    })),
+                )
+                .child(
+                    pill_button(
+                        "files-sections-empty-new",
+                        icons::PLUS,
+                        "New side chat",
+                        theme,
+                    )
+                    .on_click(cx.listener(|_, _, _, cx| {
+                        cx.stop_propagation();
+                        cx.emit(FilesEvent::NewChildChat);
+                    })),
+                )
+                .into_any_element();
+            return empty_state(
+                "Side chats will appear here when they are created",
+                Some(actions),
+                theme,
+            );
         }
         let view = cx.entity_id();
+        let shown = self.sections.shown(Section::Chats);
         let mut list = row_list("files-chat-rows");
-        for row in rows {
+        for row in rows.iter().take(shown) {
             let glyph = status_glyph(
                 format!("files-chat-{}", row.chat_id),
                 row.status,
@@ -580,6 +855,9 @@ impl FilesSurface {
                     .child(time_ago_label(row.time_ago.clone(), theme)),
             );
         }
+        if rows.len() > shown {
+            list = list.child(self.render_show_more(Section::Chats, rows.len() - shown, theme, cx));
+        }
         list.into_any_element()
     }
 }
@@ -588,29 +866,95 @@ fn collapse_animation() -> Animation {
     motion::COLLAPSE.animation()
 }
 
-/// The scrolling column an open section's rows live in, capped at
-/// [`MAX_VISIBLE_ROWS`] so the footer never swallows the tree.
+/// A 20px icon button in a section header, sized to sit beside the caret.
+fn header_action(
+    id: &'static str,
+    icon_path: &'static str,
+    label: &'static str,
+    theme: &Theme,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .role(gpui::Role::Button)
+        .aria_label(label)
+        .flex_none()
+        .size(px(20.0))
+        .rounded(px(5.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .hover(|s| s.bg(crate::theme::wash(0.09)))
+        .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
+        // Icons take their color on the element itself, never inherited.
+        .child(
+            icon(icon_path)
+                .size(px(13.0))
+                .text_color(theme.text_muted.opacity(0.85)),
+        )
+}
+
+/// The empty state's pill buttons — the explorer's Retry button shape.
+fn pill_button(
+    id: &'static str,
+    icon_path: &'static str,
+    label: &'static str,
+    theme: &Theme,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .role(gpui::Role::Button)
+        .aria_label(label)
+        .h(px(26.0))
+        .px(px(10.0))
+        .rounded(px(7.0))
+        .border_1()
+        .border_color(theme.border)
+        .bg(crate::theme::wash(0.04))
+        .hover(|style| style.bg(crate::theme::wash(0.09)))
+        .cursor_pointer()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(5.0))
+        .text_size(px(11.5))
+        .text_color(theme.text)
+        .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
+        .child(icon(icon_path).size(px(12.0)).text_color(theme.text_muted))
+        .child(label)
+}
+
+/// The scrolling column an open section's rows live in; the body frame
+/// sets the height, the list fills it.
 fn row_list(id: &'static str) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
+        .h_full()
         .flex()
         .flex_col()
         .gap(px(ROW_GAP))
         .pt(px(SECTION_BODY_INSET))
-        .max_h(px(body_height(MAX_VISIBLE_ROWS)))
         .overflow_y_scroll()
 }
 
-fn empty_row(section: Section, theme: &Theme) -> AnyElement {
+fn empty_state(copy: &'static str, actions: Option<AnyElement>, theme: &Theme) -> AnyElement {
     div()
-        .h(px(EMPTY_ROW_HEIGHT))
-        .mt(px(SECTION_BODY_INSET))
+        .pt(px(SECTION_BODY_INSET))
         .px(px(Theme::SPACE_SM))
         .flex()
-        .items_center()
-        .text_size(crate::typography::ui_rems(12.0))
-        .text_color(theme.text_muted.opacity(0.4))
-        .child(section.empty_copy())
+        .flex_col()
+        .child(
+            div()
+                .min_h(px(EMPTY_LINE_HEIGHT))
+                .max_h(px(EMPTY_LINE_HEIGHT))
+                .overflow_hidden()
+                .py(px(2.0))
+                .text_size(crate::typography::ui_rems(12.0))
+                .line_height(px(16.0))
+                .text_color(theme.text_muted.opacity(0.5))
+                .child(copy),
+        )
+        .children(actions)
         .into_any_element()
 }
 
@@ -823,12 +1167,53 @@ mod tests {
     }
 
     #[test]
-    fn body_height_caps_at_the_visible_row_budget() {
-        assert_eq!(body_height(0), SECTION_BODY_INSET + EMPTY_ROW_HEIGHT);
-        assert_eq!(body_height(1), SECTION_BODY_INSET + ROW_HEIGHT);
+    fn content_height_pages_at_ten_rows_and_counts_the_show_more_row() {
+        let one = content_height(Section::Chats, 1, INITIAL_ROWS);
+        assert_eq!(one, SECTION_BODY_INSET + ROW_HEIGHT);
+        let ten = content_height(Section::Chats, 10, INITIAL_ROWS);
+        // Eleven rows: ten visible plus the "Show more" slot.
+        let eleven = content_height(Section::Chats, 11, INITIAL_ROWS);
+        assert_eq!(eleven - ten, ROW_HEIGHT + ROW_GAP);
+        // Paging once reveals up to 35 rows before the next "Show more".
+        let paged = content_height(Section::Chats, 40, INITIAL_ROWS + PAGE_ROWS);
         assert_eq!(
-            body_height(MAX_VISIBLE_ROWS),
-            body_height(MAX_VISIBLE_ROWS + 10)
+            paged,
+            SECTION_BODY_INSET + 36.0 * ROW_HEIGHT + 35.0 * ROW_GAP
         );
+        // Empty sections want their copy; Chats adds the action row.
+        assert!(
+            content_height(Section::Chats, 0, INITIAL_ROWS)
+                > content_height(Section::Subagents, 0, INITIAL_ROWS)
+        );
+    }
+
+    #[test]
+    fn body_budget_shares_the_footer_and_hands_slack_across() {
+        // Both fit: each takes what it wants.
+        assert_eq!(
+            body_budget(300.0, [100.0, 100.0], [true, true]),
+            [100.0, 100.0]
+        );
+        // Closed sections take nothing.
+        assert_eq!(
+            body_budget(300.0, [100.0, 100.0], [false, true]),
+            [0.0, 100.0]
+        );
+        // Both oversubscribed: an even split.
+        assert_eq!(
+            body_budget(200.0, [500.0, 500.0], [true, true]),
+            [100.0, 100.0]
+        );
+        // A short second section hands its slack to the first.
+        assert_eq!(
+            body_budget(200.0, [500.0, 40.0], [true, true]),
+            [160.0, 40.0]
+        );
+        // A short first section hands its slack to the second.
+        assert_eq!(
+            body_budget(200.0, [40.0, 500.0], [true, true]),
+            [40.0, 160.0]
+        );
+        assert_eq!(body_budget(-5.0, [40.0, 500.0], [true, true]), [0.0, 0.0]);
     }
 }

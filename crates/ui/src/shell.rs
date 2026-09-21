@@ -3081,7 +3081,9 @@ impl Shell {
                     // surface never emits them.
                     FilesEvent::OpenSubagent { .. }
                     | FilesEvent::OpenChildChat(_)
-                    | FilesEvent::NewChildChat => {}
+                    | FilesEvent::NewChildChat
+                    | FilesEvent::ForkChat
+                    | FilesEvent::SectionsHeightChanged(_) => {}
                     FilesEvent::CloseCancelled => {
                         this.cancel_file_close(RightSurface::File(id), cx)
                     }

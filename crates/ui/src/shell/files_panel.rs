@@ -203,9 +203,17 @@ impl Shell {
                     ),
                     FilesEvent::OpenChildChat(chat_id) => this.open_child_chat_tab(chat_id, cx),
                     FilesEvent::NewChildChat => this.create_child_chat(None, cx),
+                    FilesEvent::ForkChat => this.create_side_chat(cx),
+                    FilesEvent::SectionsHeightChanged(height) => {
+                        this.settings.files_sections_height =
+                            crate::settings::clamp_files_sections_height(*height);
+                        this.schedule_save(cx);
+                    }
                     _ => cx.notify(),
                 },
             );
+            let height = self.settings.files_sections_height;
+            files.update(cx, |files, cx| files.set_sections_height(height, cx));
             self.files.insert(key.clone(), files);
             self.files_subs.insert(key.clone(), sub);
         }
