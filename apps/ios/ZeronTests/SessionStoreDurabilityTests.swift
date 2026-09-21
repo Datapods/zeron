@@ -126,6 +126,20 @@ final class SessionStoreDurabilityTests: XCTestCase {
         XCTAssertFalse(saver.isDirty)
     }
 
+    func testRetireTimersLeavesDirtyAndCancelsDebounce() async {
+        var saves = 0
+        let saver = DocSaver {
+            saves += 1
+            return true
+        }
+        saver.poke()
+        saver.retireTimers()
+
+        try? await Task.sleep(nanoseconds: 2_000_000_000)
+        XCTAssertTrue(saver.isDirty)
+        XCTAssertEqual(saves, 0)
+    }
+
     func testCommitAsyncRetiresRetryWhileExporting() async {
         let started = expectation(description: "detached export started")
         let gate = DispatchSemaphore(value: 0)
@@ -184,32 +198,28 @@ final class SessionStoreDurabilityTests: XCTestCase {
         }
         a.poke()
         b.poke()
+        a.retireTimers()
+        b.retireTimers()
 
         let task = Task { @MainActor in
-            await withTaskGroup(of: Void.self) { group in
-                group.addTask {
-                    _ = await a.commitAsync(
-                        export: {
-                            started.fulfill()
-                            gate.wait()
-                            return Data([9])
-                        },
-                        write: { _ in
-                            aWrote = true
-                            return true
-                        }
-                    )
+            _ = await a.commitAsync(
+                export: {
+                    started.fulfill()
+                    gate.wait()
+                    return Data([9])
+                },
+                write: { _ in
+                    aWrote = true
+                    return true
                 }
-                group.addTask {
-                    _ = await b.commitAsync(
-                        export: { Data([10]) },
-                        write: { _ in
-                            bWrote = true
-                            return true
-                        }
-                    )
+            )
+            _ = await b.commitAsync(
+                export: { Data([10]) },
+                write: { _ in
+                    bWrote = true
+                    return true
                 }
-            }
+            )
         }
 
         await fulfillment(of: [started], timeout: 1)

@@ -673,14 +673,10 @@ final class AppModel {
             }
         }
         state.setIdentifier(identifier)
+        stores.forEach { $0.retireSaverTimers() }
         Task { @MainActor [stores, state] in
-            await withTaskGroup(of: Void.self) { group in
-                for store in stores {
-                    guard !state.isCancelled, !store.stopped else { break }
-                    group.addTask {
-                        await store.flushToDiskAsync()
-                    }
-                }
+            for store in stores where !state.isCancelled && !store.stopped {
+                await store.flushToDiskAsync()
             }
             let identifier = state.finish()
             if identifier != .invalid {

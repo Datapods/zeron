@@ -414,6 +414,10 @@ final class SessionStore {
         saver?.flush()
     }
 
+    func retireSaverTimers() {
+        saver?.retireTimers()
+    }
+
     func flushToDiskAsync() async {
         guard !stopped, let saver else { return }
         let cursor = self.cursor

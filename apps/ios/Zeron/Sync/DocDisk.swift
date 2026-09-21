@@ -305,6 +305,10 @@ final class DocSaver {
         self.save = save
     }
 
+    func retireTimers() {
+        generation += 1
+    }
+
     func poke() {
         dirty = true
         generation += 1
