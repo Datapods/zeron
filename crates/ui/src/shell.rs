@@ -743,7 +743,11 @@ const SIDEBAR_ACTIVE_HARNESS_TITLE_GAP: f32 = Theme::SPACE_SM;
 
 /// Keep the fade short so only the last few glyphs recede. Tracking clipped
 /// content lets the shared paint-time overflow gate leave fitting labels intact.
-fn sidebar_faded_label(id: SharedString, fill: bool, label: impl IntoElement) -> impl IntoElement {
+pub(crate) fn sidebar_faded_label(
+    id: SharedString,
+    fill: bool,
+    label: impl IntoElement,
+) -> impl IntoElement {
     let overflow = gpui::ScrollHandle::new();
     crate::edge_fade::edge_faded(
         20.0,
@@ -3083,8 +3087,7 @@ impl Shell {
                     FilesEvent::OpenSubagent { .. }
                     | FilesEvent::OpenChildChat(_)
                     | FilesEvent::NewChildChat
-                    | FilesEvent::ForkChat
-                    | FilesEvent::SectionsHeightChanged(_) => {}
+                    | FilesEvent::ForkChat => {}
                     FilesEvent::CloseCancelled => {
                         this.cancel_file_close(RightSurface::File(id), cx)
                     }
@@ -7924,14 +7927,27 @@ impl Shell {
             cx.stop_propagation();
             return;
         }
-        let selected_chat = self.state.read(cx).selected_chat.clone();
+        // Escape targets the conversation that owns the focused composer: a
+        // side chat's when its composer has focus, the main one otherwise.
+        let (state, composer) = self
+            .side_chats
+            .values()
+            .find(|tab| {
+                tab.composer
+                    .read(cx)
+                    .focus_handle(cx)
+                    .contains_focused(window, cx)
+            })
+            .map(|tab| (tab.state.clone(), tab.composer.clone()))
+            .unwrap_or_else(|| (self.state.clone(), self.composer.clone()));
+        let selected_chat = state.read(cx).selected_chat.clone();
         let indicator = selected_chat
             .as_deref()
-            .map(|chat_id| self.state.read(cx).indicator_for(chat_id, Utc::now()))
+            .map(|chat_id| state.read(cx).indicator_for(chat_id, Utc::now()))
             .unwrap_or(Indicator::None);
         let interrupting = selected_chat
             .as_deref()
-            .is_some_and(|chat_id| self.composer.read(cx).is_interrupting(chat_id));
+            .is_some_and(|chat_id| composer.read(cx).is_interrupting(chat_id));
         let escape_stops_active_agent = self.settings.escape_stops_active_agent;
 
         match resolve_shell_escape(
@@ -7946,8 +7962,7 @@ impl Shell {
             ShellEscapeOutcome::Blocked => cx.stop_propagation(),
             ShellEscapeOutcome::InterruptChat(chat_id) => {
                 cx.stop_propagation();
-                self.composer
-                    .update(cx, |composer, cx| composer.interrupt_chat(chat_id, cx));
+                composer.update(cx, |composer, cx| composer.interrupt_chat(chat_id, cx));
             }
             ShellEscapeOutcome::OtherKey | ShellEscapeOutcome::Ignored => {}
         }
@@ -9242,23 +9257,6 @@ impl Shell {
                             }),
                         ),
                     )
-                    .child(
-                        row(
-                            "surface-card-side-chat",
-                            icons::CHAT_ROUND_LINE,
-                            if self.side_chat_creating {
-                                "Creating side chat…"
-                            } else {
-                                "Side chat"
-                            },
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| this.create_side_chat(cx))),
-                    )
-                    .children(
-                        self.side_chat_error
-                            .clone()
-                            .map(|error| div().text_color(theme.text_muted).child(error)),
-                    )
                     // Git surfaces only where there IS git — the pane itself
                     // no longer gates on it (terminals work anywhere).
                     .when(self.space_git_detected(cx), |el| {
@@ -9778,20 +9776,6 @@ impl Shell {
                         .flex()
                         .flex_col()
                         .gap(px(2.0))
-                        .child(
-                            popover::menu_row(&theme, false, "right-plus-side-chat")
-                                .id("right-plus-side-chat-row")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.set_right_active(RightSurface::Picker, cx);
-                                    this.close_right_plus(cx);
-                                }))
-                                .child(
-                                    icon(icons::CHAT_ROUND_LINE)
-                                        .size(px(13.0))
-                                        .text_color(theme.text_muted),
-                                )
-                                .child(SharedString::from("Side chats")),
-                        )
                         .child(
                             popover::menu_row(&theme, false, "right-plus-files")
                                 .id("right-plus-files-row")

@@ -165,27 +165,53 @@ impl Shell {
         self.open_side_chat(chat, key, cx);
     }
 
+    /// Reveal the surface host of the pane keyed `key`: the live one through
+    /// the user-visible path, a background conversation's by flag, so a
+    /// fork that finishes after the user switched away opens ITS pane, not
+    /// whichever is on screen.
+    fn open_surfaces_for(&mut self, key: &str, cx: &mut Context<Self>) {
+        if key == self.panel_key(cx) {
+            // Programmatic, so an already-open pane is left alone.
+            self.set_surfaces_open(true, cx);
+        } else {
+            self.panels.update(key, |p| p.changes_open = true);
+        }
+    }
+
     pub(super) fn open_side_chat(
         &mut self,
         chat: zeron_proto::Chat,
         key: String,
         cx: &mut Context<Self>,
     ) {
+        // A footer row or header button may land while the surface host is
+        // closed (explorer-only pane, or hidden with its tabs kept): open it
+        // beside the explorer first, for an existing tab too.
+        self.open_surfaces_for(&key, cx);
         if let Some((&id, _)) = self
             .side_chats
             .iter()
             .find(|(_, tab)| tab.state.read(cx).selected_chat.as_deref() == Some(&chat.id))
         {
-            self.set_right_active(RightSurface::SideChat(id), cx);
+            if key == self.panel_key(cx) {
+                self.set_right_active(RightSurface::SideChat(id), cx);
+            } else {
+                self.panels
+                    .update(&key, |p| p.right_active = RightSurface::SideChat(id));
+            }
+            cx.notify();
             return;
         }
-        // A footer row or header button may land while the surface host is
-        // closed (explorer-only pane): open it beside the explorer first.
-        // Programmatic, so an already-open pane is left alone.
-        self.set_surfaces_open(true, cx);
+        let chat_id = chat.id.clone();
         let parent = self.state.clone();
         let state = cx.new(|cx| AppState::side_chat_state(&parent, chat, cx));
         let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
+        // Workspace file links open the editor and web links honor the
+        // in-app preference, resolved in this side chat's context.
+        let links = Self::session_links(Some(chat_id), cx);
+        transcript.update(cx, |transcript, _| {
+            transcript.set_workspace_link_handler(links)
+        });
         let composer = cx.new(|cx| Composer::new(state.clone(), cx));
         let events = vec![
             cx.subscribe(&transcript, Self::on_transcript_event),
@@ -437,6 +463,14 @@ impl Shell {
         };
         let transcript = tab.transcript.clone();
         let composer = tab.composer.clone();
+        // The main composer is driven by the shell's dock (settled, docked)
+        // and fed the column width; give the side chat's the same inputs so
+        // both take the same height branch.
+        let width = self.right_visible_width(cx);
+        composer.update(cx, |composer, cx| {
+            composer.set_dock_frame(crate::composer_dock::DockFrame::settled(true), cx);
+            composer.set_available_width(width, cx);
+        });
         let pill = transcript.read(cx).jump_button_shown().then(|| {
             div()
                 .absolute()

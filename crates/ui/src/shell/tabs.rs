@@ -295,7 +295,11 @@ impl Shell {
                 .h_full()
                 .flex()
                 .flex_row()
-                .items_center();
+                .items_center()
+                // The transcript extends under this band (it fades beneath
+                // the tab strip); a wheel over the tabs must scroll the
+                // strip, never the surface behind it.
+                .on_scroll_wheel(|_, _, cx| cx.stop_propagation());
             if right_pane_open {
                 // The right pane's SURFACE TABS (t3 RightPanelTabs) — the diff
                 // options that used to live here moved into the pane's own

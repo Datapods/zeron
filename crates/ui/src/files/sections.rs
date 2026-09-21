@@ -9,10 +9,9 @@
 //! and fork beside its caret; the section chrome animates with the same
 //! collapse motion as the sidebar's disclosures.
 //!
-//! The footer is a pane of its own: its height is dragged at the seam with
-//! the tree and persisted (`UiSettings::files_sections_height`), open
-//! sections share that height and scroll, and like the sidebar's Archived
-//! shelf each shows ten rows before a "Show N more" row pages by ten.
+//! The footer has a fixed height budget that the open sections share and
+//! scroll inside, and like the sidebar's Archived shelf each shows ten rows
+//! before a "Show N more" row pages by ten.
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -20,7 +19,7 @@ use std::hash::{Hash, Hasher};
 use chrono::{DateTime, Utc};
 use gpui::{
     Animation, AnimationExt as _, AnyElement, Context, EntityId, MouseButton, ScrollHandle,
-    SharedString, Window, div, prelude::*, px,
+    SharedString, div, prelude::*, px,
 };
 use zeron_doc::{MessagePart, SubagentStatus};
 use zeron_proto::{Chat, ChatIndicator};
@@ -56,8 +55,8 @@ const PAGE_ROWS: usize = 10;
 const MIN_BODY_HEIGHT: f32 = 120.0;
 const FOOTER_PAD_TOP: f32 = 4.0;
 const FOOTER_PAD_BOTTOM: f32 = 6.0;
-/// Drag hitbox straddling the seam with the tree.
-const RESIZE_HITBOX: f32 = 8.0;
+/// The footer's height budget; shorter content shrinks the footer to fit.
+const FOOTER_HEIGHT: f32 = 510.0;
 const TWEEN_GRACE: std::time::Duration = std::time::Duration::from_millis(120);
 
 /// Which footer section a motion or toggle addresses.
@@ -80,17 +79,6 @@ impl Section {
             Section::Subagents => "Subagents",
             Section::Chats => "Chats",
         }
-    }
-}
-
-/// Drag payload for the seam between the tree and the footer.
-pub(super) struct SectionsResize;
-
-struct DragGhost;
-
-impl gpui::Render for DragGhost {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        gpui::Empty
     }
 }
 
@@ -131,10 +119,6 @@ pub(super) struct ExplorerSections {
     /// One scroll handle per section list, so the edge fades can read
     /// overflow at paint time.
     scroll: HashMap<Section, ScrollHandle>,
-    /// The footer's height budget when its content wants more (persisted by
-    /// the shell); shorter content shrinks the footer to fit.
-    pub(super) height: f32,
-    resizing: bool,
     /// Hash of what the footer would draw, so the state observer only
     /// re-renders the explorer when a section's contents actually changed —
     /// not on every streamed transcript delta.
@@ -155,8 +139,6 @@ impl Default for ExplorerSections {
             ]
             .into_iter()
             .collect(),
-            height: crate::settings::FILES_SECTIONS_DEFAULT,
-            resizing: false,
             fingerprint: 0,
         }
     }
@@ -285,6 +267,8 @@ pub(super) struct ChildChatRow {
     pub title: SharedString,
     pub status: ChatIndicator,
     pub time_ago: SharedString,
+    /// The chat's linked pull request, drawn as the sidebar's badge.
+    pub change_request: Option<zeron_proto::ChangeRequestSummary>,
     activity: DateTime<Utc>,
 }
 
@@ -306,6 +290,7 @@ pub(super) fn child_chat_rows(
                 title: child_chat_title(chat).into(),
                 status: state.display_status_for(chat, now),
                 time_ago: zeron_proto::view::format_time_ago(activity, now).into(),
+                change_request: state.change_request_for_chat(chat).cloned(),
                 activity,
             }
         })
@@ -338,6 +323,10 @@ pub(super) fn fingerprint(state: &AppState, chat_id: &str, now: DateTime<Utc>) -
         row.title.as_ref().hash(&mut hasher);
         (row.status as u8).hash(&mut hasher);
         row.time_ago.as_ref().hash(&mut hasher);
+        row.change_request
+            .as_ref()
+            .map(|pr| (pr.number, pr.state as u8))
+            .hash(&mut hasher);
     }
     hasher.finish()
 }
@@ -396,34 +385,6 @@ impl FilesSurface {
         }
     }
 
-    /// The shell hands the persisted footer height in after construction.
-    pub fn set_sections_height(&mut self, height: f32, cx: &mut Context<Self>) {
-        let height = crate::settings::clamp_files_sections_height(height);
-        if (self.sections.height - height).abs() > f32::EPSILON {
-            self.sections.height = height;
-            cx.notify();
-        }
-    }
-
-    /// Drag on the seam: the footer's bottom is the surface's bottom, so its
-    /// height is the distance from the pointer to the window's bottom edge.
-    pub(super) fn on_sections_drag(
-        &mut self,
-        event: &gpui::DragMoveEvent<SectionsResize>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let requested =
-            f32::from(window.viewport_size().height) - f32::from(event.event.position.y);
-        let height = crate::settings::clamp_files_sections_height(requested);
-        self.sections.resizing = true;
-        if (self.sections.height - height).abs() > 0.5 {
-            self.sections.height = height;
-            cx.emit(FilesEvent::SectionsHeightChanged(height));
-        }
-        cx.notify();
-    }
-
     pub(super) fn render_sections(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let now = Utc::now();
         let (subagents, chats) = {
@@ -450,7 +411,7 @@ impl FilesSurface {
             self.sections.is_open(Section::Subagents),
             self.sections.is_open(Section::Chats),
         ];
-        let budget = self.sections.height - chrome_height();
+        let budget = FOOTER_HEIGHT - chrome_height();
         let heights = body_budget(budget, wants, open);
         let view = cx.entity_id();
         let subagent_body = self.render_subagent_rows(&subagents, view, theme, cx);
@@ -466,7 +427,6 @@ impl FilesSurface {
             .px(px(6.0))
             .pt(px(FOOTER_PAD_TOP))
             .pb(px(FOOTER_PAD_BOTTOM))
-            .child(self.render_resize_seam(theme, cx))
             .child(self.render_section(
                 Section::Subagents,
                 subagents.len(),
@@ -487,54 +447,6 @@ impl FilesSurface {
                 theme,
                 cx,
             ))
-            .into_any_element()
-    }
-
-    /// The drag seam at the footer's top edge: the app's pane-seam
-    /// treatment — nothing at rest, a 1px highlight that fades in on hover
-    /// and stays lit while dragging (see `Shell::resize_handle`).
-    fn render_resize_seam(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let fade_key = "files-sections-seam";
-        let active = self.sections.resizing;
-        let highlight = if active {
-            theme.border_strong
-        } else {
-            motion::hover_blend(
-                fade_key,
-                theme.border_strong.opacity(0.0),
-                theme.border_strong,
-            )
-        };
-        div()
-            .id("files-sections-resize")
-            .absolute()
-            .top(px(-RESIZE_HITBOX / 2.0))
-            .left_0()
-            .right_0()
-            .h(px(RESIZE_HITBOX))
-            .occlude()
-            .cursor_row_resize()
-            .flex()
-            .flex_col()
-            .justify_center()
-            .on_hover(motion::hover_listener(fade_key))
-            .child(div().h(px(1.0)).w_full().bg(highlight))
-            .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
-            .on_drag(SectionsResize, |_, _, _, cx| cx.new(|_| DragGhost))
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.sections.resizing = false;
-                    cx.notify();
-                }),
-            )
-            .on_mouse_up_out(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.sections.resizing = false;
-                    cx.notify();
-                }),
-            )
             .into_any_element()
     }
 
@@ -603,7 +515,7 @@ impl FilesSurface {
         let full = if open {
             height
         } else {
-            wanted.min(self.sections.height - chrome_height()).max(0.0)
+            wanted.min(FOOTER_HEIGHT - chrome_height()).max(0.0)
         };
         let header = div()
             .id(SharedString::from(format!(
@@ -803,7 +715,10 @@ impl FilesSurface {
                         });
                     }))
                     .child(glyph)
-                    .child(row_title(row.title.clone()))
+                    .child(row_title(
+                        format!("files-subagent-title-{}", row.doc_id),
+                        row.title.clone(),
+                    ))
                     .child(time_ago_label(
                         zeron_proto::view::format_time_ago(row.spawned_at, now).into(),
                         theme,
@@ -886,7 +801,18 @@ impl FilesSurface {
                         cx.emit(FilesEvent::OpenChildChat(open_id.clone()));
                     }))
                     .child(glyph)
-                    .child(row_title(row.title.clone()))
+                    .child(row_title(
+                        format!("files-chat-title-{}", row.chat_id),
+                        row.title.clone(),
+                    ))
+                    .children(row.change_request.clone().map(|summary| {
+                        crate::change_requests::pull_request_badge(
+                            format!("files-chat-pr-{}", row.chat_id).into(),
+                            summary,
+                            crate::change_requests::ChangeRequestBadgeSurface::Sidebar,
+                            theme,
+                        )
+                    }))
                     .child(time_ago_label(row.time_ago.clone(), theme)),
             );
         }
@@ -1039,14 +965,17 @@ fn time_ago_label(text: SharedString, theme: &Theme) -> gpui::Div {
         .child(text)
 }
 
-fn row_title(title: SharedString) -> gpui::Div {
-    div()
-        .flex_1()
-        .min_w_0()
-        .truncate()
-        .text_size(crate::typography::ui_rems(13.0))
-        .line_height(px(17.0))
-        .child(title)
+/// The sidebar's fading label: overflow dissolves at the right edge instead
+/// of an ellipsis.
+fn row_title(id: String, title: SharedString) -> impl IntoElement {
+    crate::shell::sidebar_faded_label(
+        id.into(),
+        true,
+        div()
+            .text_size(crate::typography::ui_rems(13.0))
+            .line_height(px(17.0))
+            .child(title),
+    )
 }
 
 /// The compact row's 13px status slot: Working animates the glyph spinner,

@@ -164,8 +164,6 @@ pub enum FilesEvent {
     NewChildChat,
     /// The Chats header's fork: fork the active chat into a side chat.
     ForkChat,
-    /// The footer was dragged to a new height (persist it).
-    SectionsHeightChanged(f32),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -268,9 +266,6 @@ impl Render for FilesSurface {
             .flex()
             .bg(crate::theme::ink(0.0))
             .flex_col()
-            .when(!is_editor, |el| {
-                el.on_drag_move(cx.listener(Self::on_sections_drag))
-            })
             .children(header)
             .child(div().flex_1().min_h_0().w_full().child(body))
             .children(sections)
