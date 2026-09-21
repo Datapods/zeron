@@ -334,11 +334,11 @@ final class DocSaver {
         return true
     }
 
-    /// Off-main commit: export runs detached, then the write returns to the
-    /// main actor and is dropped if a newer commit landed meanwhile.
+    /// Exports off-main and writes on the main actor only for the current generation.
     func commitAsync(export: @escaping @Sendable () -> Data?,
                      write: @escaping (Data) -> Bool) async -> Bool {
         guard dirty else { return true }
+        generation += 1
         let expected = generation
         let snapshot = await Task.detached(priority: .utility) { export() }.value
         guard generation == expected else { return false }

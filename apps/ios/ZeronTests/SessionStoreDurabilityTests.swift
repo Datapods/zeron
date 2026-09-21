@@ -89,6 +89,173 @@ final class SessionStoreDurabilityTests: XCTestCase {
         XCTAssertTrue(saver.isDirty)
     }
 
+    func testCommitAsyncRetiresDebounceWhileExporting() async {
+        let started = expectation(description: "detached export started")
+        let gate = DispatchSemaphore(value: 0)
+        var saves = 0
+        var wrote = false
+        let saver = DocSaver {
+            saves += 1
+            return true
+        }
+        saver.poke()
+
+        let task = Task { @MainActor in
+            await saver.commitAsync(
+                export: {
+                    started.fulfill()
+                    gate.wait()
+                    return Data([7])
+                },
+                write: { _ in
+                    wrote = true
+                    return true
+                }
+            )
+        }
+
+        await fulfillment(of: [started], timeout: 1)
+        try? await Task.sleep(nanoseconds: 2_000_000_000)
+        XCTAssertEqual(saves, 0)
+        XCTAssertFalse(wrote)
+
+        gate.signal()
+        let result = await task.value
+        XCTAssertTrue(result)
+        XCTAssertTrue(wrote)
+        XCTAssertFalse(saver.isDirty)
+    }
+
+    func testCommitAsyncRetiresRetryWhileExporting() async {
+        let started = expectation(description: "detached export started")
+        let gate = DispatchSemaphore(value: 0)
+        var saves = 0
+        var shouldSucceed = false
+        var wrote = false
+        let saver = DocSaver {
+            saves += 1
+            return shouldSucceed
+        }
+        saver.poke()
+        XCTAssertFalse(saver.commitNow())
+        XCTAssertEqual(saves, 1)
+
+        let task = Task { @MainActor in
+            await saver.commitAsync(
+                export: {
+                    started.fulfill()
+                    gate.wait()
+                    return Data([8])
+                },
+                write: { _ in
+                    wrote = true
+                    return true
+                }
+            )
+        }
+
+        await fulfillment(of: [started], timeout: 1)
+        try? await Task.sleep(nanoseconds: 2_500_000_000)
+        XCTAssertEqual(saves, 1)
+        XCTAssertFalse(wrote)
+
+        shouldSucceed = true
+        gate.signal()
+        let result = await task.value
+        XCTAssertTrue(result)
+        XCTAssertTrue(wrote)
+        XCTAssertFalse(saver.isDirty)
+    }
+
+    func testAsyncFlushesRetireBothTimers() async {
+        let started = expectation(description: "first detached export started")
+        let gate = DispatchSemaphore(value: 0)
+        var aSaves = 0
+        var bSaves = 0
+        var aWrote = false
+        var bWrote = false
+        let a = DocSaver {
+            aSaves += 1
+            return true
+        }
+        let b = DocSaver {
+            bSaves += 1
+            return true
+        }
+        a.poke()
+        b.poke()
+
+        let task = Task { @MainActor in
+            await withTaskGroup(of: Void.self) { group in
+                group.addTask {
+                    _ = await a.commitAsync(
+                        export: {
+                            started.fulfill()
+                            gate.wait()
+                            return Data([9])
+                        },
+                        write: { _ in
+                            aWrote = true
+                            return true
+                        }
+                    )
+                }
+                group.addTask {
+                    _ = await b.commitAsync(
+                        export: { Data([10]) },
+                        write: { _ in
+                            bWrote = true
+                            return true
+                        }
+                    )
+                }
+            }
+        }
+
+        await fulfillment(of: [started], timeout: 1)
+        try? await Task.sleep(nanoseconds: 2_000_000_000)
+        XCTAssertEqual(aSaves, 0)
+        XCTAssertEqual(bSaves, 0)
+
+        gate.signal()
+        await task.value
+        XCTAssertTrue(aWrote)
+        XCTAssertTrue(bWrote)
+        XCTAssertFalse(a.isDirty)
+        XCTAssertFalse(b.isDirty)
+    }
+
+    func testCommitAsyncDropsExportAfterNewPoke() async {
+        let started = expectation(description: "detached export started")
+        let gate = DispatchSemaphore(value: 0)
+        var wrote = false
+        let saver = DocSaver { true }
+        saver.poke()
+
+        let task = Task { @MainActor in
+            await saver.commitAsync(
+                export: {
+                    started.fulfill()
+                    gate.wait()
+                    return Data([11])
+                },
+                write: { _ in
+                    wrote = true
+                    return true
+                }
+            )
+        }
+
+        await fulfillment(of: [started], timeout: 1)
+        saver.poke()
+        gate.signal()
+
+        let result = await task.value
+        XCTAssertFalse(result)
+        XCTAssertFalse(wrote)
+        XCTAssertTrue(saver.isDirty)
+    }
+
     func testRealStoreAsyncFlushPersistsOutbox() async throws {
         let id = "async-flush-\(UUID().uuidString)"
         let url = DocDisk.chat2URL(for: id)
