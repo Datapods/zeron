@@ -1043,17 +1043,7 @@ impl FilesSurface {
         use gpui::Focusable;
         let include_ignored = self.tree.include_ignored();
         let search_focus = self.search.focus_handle(cx);
-        // The explorer's toolbar is bare: no hairlines, no raised wash —
-        // the pane reads as one quiet column (the editor keeps the shared
-        // bordered toolbar for its breadcrumbs).
-        div()
-            .h(px(crate::surface_chrome::HEADER_HEIGHT))
-            .w_full()
-            .flex_none()
-            .px(px(crate::surface_chrome::EDGE_INSET))
-            .flex()
-            .items_center()
-            .gap(px(crate::surface_chrome::CONTROL_GAP))
+        toolbar(theme)
             .id("files-explorer-header")
             .debug_selector(|| "files-explorer-header".into())
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
