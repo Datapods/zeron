@@ -509,12 +509,12 @@ final class SessionStore {
             let firstContactQueued = self.firstContactQueued
             let outbox = self.outbox
             let chatId = self.chatId
+            let leaseToken = self.leaseToken
             Task { @MainActor [weak self, saver, doc] in
                 _ = await saver.commitAsync(
                     export: { try? doc.export(mode: .snapshot) },
                     write: { [weak self] snapshot in
-                        guard let self,
-                              SnapshotLease.isCurrent(chatId, self.leaseToken) else {
+                        guard SnapshotLease.isCurrent(chatId, leaseToken) else {
                             return false
                         }
                         guard let written = DocDisk.saveChat2ReturningBytes(
@@ -527,7 +527,7 @@ final class SessionStore {
                         ) else {
                             return false
                         }
-                        self.snapshotBytes = written
+                        self?.snapshotBytes = written
                         return true
                     }
                 )

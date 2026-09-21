@@ -545,6 +545,57 @@ final class SessionStoreDurabilityTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: DocDisk.chat2URL(for: id).path))
     }
 
+    func testStoppedStoreWritesAfterDeallocation() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("zeron-lease-deallocated-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let blockerFile = root.appendingPathComponent("blocker")
+        let failingDirectory = blockerFile.appendingPathComponent("dir")
+        try Data("not a directory".utf8).write(to: blockerFile)
+        DocDisk.directoryOverride = failingDirectory
+        defer {
+            DocDisk.directoryOverride = nil
+            try? FileManager.default.removeItem(at: root)
+        }
+
+        let gate = DispatchSemaphore(value: 0)
+        let started = expectation(description: "blocking export started")
+        let exportBlocker = Task {
+            await SnapshotExporter.shared.export {
+                started.fulfill()
+                gate.wait()
+                return Data([0])
+            }
+        }
+        await fulfillment(of: [started], timeout: 1)
+
+        let id = "lease-deallocated-\(UUID().uuidString)"
+        var batchID = ""
+        weak var weakStore: SessionStore?
+        do {
+            let store = SessionStore(chatId: id, config: config())
+            weakStore = store
+            store.start(holdDial: true)
+            try appendEntry(store, id: "deallocated", text: "deallocated")
+            store.doc.commit()
+            for _ in 0..<20 {
+                await Task.yield()
+                if store.outbox.count == 1 { break }
+            }
+            batchID = try XCTUnwrap(store.outbox.first?.batchId)
+            store.stop()
+        }
+        XCTAssertNil(weakStore)
+
+        DocDisk.directoryOverride = root
+        gate.signal()
+        _ = await exportBlocker.value
+        try await Task.sleep(for: .milliseconds(100))
+
+        let loaded = try XCTUnwrap(DocDisk.loadChat2(into: LoroDoc(), id: id))
+        XCTAssertEqual(loaded.outbox.map(\.batchId), [batchID])
+    }
+
     func testReplacementStoreWinsOverStoppedStoreExport() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("zeron-lease-replacement-\(UUID().uuidString)", isDirectory: true)
