@@ -1068,10 +1068,7 @@ impl FilesSurface {
                     .debug_selector(|| "files-search".into())
                     .overflow_hidden()
                     .cursor_text()
-                    // No box around search: the magnifier and placeholder
-                    // alone mark the field, a hover wash the hit area.
-                    .bg(gpui::transparent_black())
-                    .hover(|style| style.bg(crate::theme::wash(0.04)))
+                    .hover(|style| style.bg(crate::theme::ink(0.055)))
                     // Clicking the field's padding focuses the input too.
                     .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| {
                         window.focus(&search_focus, cx);

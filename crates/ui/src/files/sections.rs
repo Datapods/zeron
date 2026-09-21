@@ -36,10 +36,9 @@ const SECTION_HEADER_HEIGHT: f32 = 28.0;
 const SECTION_BODY_INSET: f32 = 4.0;
 const ROW_HEIGHT: f32 = 29.0;
 const ROW_GAP: f32 = 2.0;
-/// Empty state: a quiet icon, the copy (two 16px lines so it can wrap in a
-/// narrow explorer), and for Chats a row of pill actions — sized so an
-/// empty section still reads as a place, not a gap.
-const EMPTY_ICON_BLOCK: f32 = 30.0;
+/// Empty state: the copy (two 16px lines so it can wrap in a narrow
+/// explorer) and, for Chats, a row of pill actions — left-aligned like the
+/// rows it stands in for.
 const EMPTY_COPY_HEIGHT: f32 = 36.0;
 const EMPTY_ACTIONS_HEIGHT: f32 = 40.0;
 const EMPTY_PAD: f32 = 10.0;
@@ -48,9 +47,6 @@ const EMPTY_PAD: f32 = 10.0;
 const LIST_FADE_BAND: f32 = 16.0;
 /// Hover group of a section header (reveals its actions).
 const HEADER_GROUP: &str = "files-section-header";
-/// The drag handle pill revealed on the seam.
-const HANDLE_WIDTH: f32 = 36.0;
-const HANDLE_HEIGHT: f32 = 4.0;
 /// Rows a section shows before "Show more" pages it, and the page size —
 /// the sidebar's Archived shelf numbers.
 const INITIAL_ROWS: usize = 10;
@@ -350,7 +346,6 @@ pub(super) fn content_height(section: Section, count: usize, shown: usize) -> f3
     if count == 0 {
         return SECTION_BODY_INSET
             + EMPTY_PAD * 2.0
-            + EMPTY_ICON_BLOCK
             + EMPTY_COPY_HEIGHT
             + match section {
                 Section::Chats => EMPTY_ACTIONS_HEIGHT,
@@ -488,13 +483,23 @@ impl FilesSurface {
             .into_any_element()
     }
 
-    /// The drag seam over the footer's top hairline: hover and drag light
-    /// the line up, the sidebar/pane seam treatment in miniature.
+    /// The drag seam at the footer's top edge: the app's pane-seam
+    /// treatment — nothing at rest, a 1px highlight that fades in on hover
+    /// and stays lit while dragging (see `Shell::resize_handle`).
     fn render_resize_seam(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let fade_key = "files-sections-seam";
         let active = self.sections.resizing;
+        let highlight = if active {
+            theme.border_strong
+        } else {
+            motion::hover_blend(
+                fade_key,
+                theme.border_strong.opacity(0.0),
+                theme.border_strong,
+            )
+        };
         div()
             .id("files-sections-resize")
-            .group("files-sections-seam")
             .absolute()
             .top(px(-RESIZE_HITBOX / 2.0))
             .left_0()
@@ -503,37 +508,10 @@ impl FilesSurface {
             .occlude()
             .cursor_row_resize()
             .flex()
-            .items_center()
+            .flex_col()
             .justify_center()
-            // With no hairline between tree and footer, the affordance is
-            // the handle itself: a short pill that rises on hover and stays
-            // lit while dragging, plus a full hairline while the seam moves.
-            .child(
-                div()
-                    .absolute()
-                    .left_0()
-                    .right_0()
-                    .h(px(1.0))
-                    .bg(if active {
-                        theme.border_strong
-                    } else {
-                        theme.border_strong.opacity(0.0)
-                    }),
-            )
-            .child(
-                div()
-                    .w(px(HANDLE_WIDTH))
-                    .h(px(HANDLE_HEIGHT))
-                    .rounded_full()
-                    .bg(if active {
-                        theme.text_muted
-                    } else {
-                        theme.text_muted.opacity(0.0)
-                    })
-                    .group_hover("files-sections-seam", |s| {
-                        s.bg(theme.text_muted.opacity(0.6))
-                    }),
-            )
+            .on_hover(motion::hover_listener(fade_key))
+            .child(div().h(px(1.0)).w_full().bg(highlight))
             .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
             .on_drag(SectionsResize, |_, _, _, cx| cx.new(|_| DragGhost))
             .on_mouse_up(
@@ -642,7 +620,6 @@ impl FilesSurface {
             .pr(px(4.0))
             .rounded(px(6.0))
             .cursor_pointer()
-            .hover(|s| s.bg(crate::theme::wash(0.04)))
             .on_click(cx.listener(move |this, _, _, cx| {
                 // Open → close runs from the painted body height to 0, and
                 // back up to what the budget allows.
@@ -789,7 +766,6 @@ impl FilesSurface {
     ) -> AnyElement {
         if rows.is_empty() {
             return empty_state(
-                icons::BOT,
                 "Subagents will appear here when they are created",
                 None,
                 theme,
@@ -849,7 +825,6 @@ impl FilesSurface {
                 .flex()
                 .flex_row()
                 .items_center()
-                .justify_center()
                 .gap(px(6.0))
                 .h(px(EMPTY_ACTIONS_HEIGHT))
                 .child(
@@ -878,7 +853,6 @@ impl FilesSurface {
                 )
                 .into_any_element();
             return empty_state(
-                icons::CHAT_ROUND_LINE,
                 "Side chats will appear here when they are created",
                 Some(actions),
                 theme,
@@ -1006,42 +980,21 @@ fn faded_list(list: gpui::Stateful<gpui::Div>, scroll: &ScrollHandle) -> AnyElem
     .into_any_element()
 }
 
-/// An empty section: a faint icon, the copy centered beneath it, and any
-/// actions on a row below — enough presence that the section reads as a
-/// place waiting to fill, not a stray caption.
-fn empty_state(
-    icon_path: &'static str,
-    copy: &'static str,
-    actions: Option<AnyElement>,
-    theme: &Theme,
-) -> AnyElement {
+/// An empty section: its copy where the first row would sit, and any
+/// actions on a row below it.
+fn empty_state(copy: &'static str, actions: Option<AnyElement>, theme: &Theme) -> AnyElement {
     div()
         .pt(px(SECTION_BODY_INSET + EMPTY_PAD))
         .pb(px(EMPTY_PAD))
         .px(px(Theme::SPACE_SM))
         .flex()
         .flex_col()
-        .items_center()
-        .child(
-            div()
-                .h(px(EMPTY_ICON_BLOCK))
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(
-                    icon(icon_path)
-                        .size(px(18.0))
-                        .text_color(theme.text_muted.opacity(0.35)),
-                ),
-        )
         .child(
             div()
                 .min_h(px(EMPTY_COPY_HEIGHT))
                 .max_h(px(EMPTY_COPY_HEIGHT))
-                .max_w(px(220.0))
                 .overflow_hidden()
                 .py(px(2.0))
-                .text_center()
                 .text_size(crate::typography::ui_rems(12.0))
                 .line_height(px(16.0))
                 .text_color(theme.text_muted.opacity(0.5))
@@ -1279,7 +1232,7 @@ mod tests {
                 - content_height(Section::Subagents, 0, INITIAL_ROWS),
             EMPTY_ACTIONS_HEIGHT
         );
-        assert!(content_height(Section::Subagents, 0, INITIAL_ROWS) >= 80.0);
+        assert!(content_height(Section::Subagents, 0, INITIAL_ROWS) >= 50.0);
     }
 
     #[test]
