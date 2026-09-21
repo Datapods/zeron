@@ -1900,14 +1900,10 @@ impl SidebarViewRow {
     }
 }
 
-const SIDEBAR_VIEW_GROUPS: [(&str, std::ops::Range<usize>); 4] = [
-    ("Organize", 0..3),
-    ("Sort", 3..5),
-    ("Show", 5..10),
-    ("Layout", 10..11),
-];
+const SIDEBAR_VIEW_GROUPS: [(&str, std::ops::Range<usize>); 3] =
+    [("Organize", 0..3), ("Sort", 3..5), ("Show", 5..10)];
 
-const SIDEBAR_VIEW_ROWS: [SidebarViewRow; 11] = [
+const SIDEBAR_VIEW_ROWS: [SidebarViewRow; 10] = [
     SidebarViewRow::ByDevice,
     SidebarViewRow::ByProject,
     SidebarViewRow::InOneList,
@@ -1918,7 +1914,6 @@ const SIDEBAR_VIEW_ROWS: [SidebarViewRow; 11] = [
     SidebarViewRow::ShowHarness,
     SidebarViewRow::ShowProjectIcon,
     SidebarViewRow::ShowProjectLabel,
-    SidebarViewRow::Compact,
 ];
 
 // list items stay tightly related at 2px, while section boundaries use 12px
@@ -3106,11 +3101,12 @@ impl Shell {
                         delta,
                     );
                 } else {
-                    menu.active = popover::menu_step(menu.active, SIDEBAR_VIEW_GROUPS.len(), delta);
+                    menu.active =
+                        popover::menu_step(menu.active, SIDEBAR_VIEW_GROUPS.len() + 1, delta);
                 }
                 cx.notify();
             }
-            "right" | "enter" => {
+            "right" | "enter" | "space" => {
                 if let Some(group) = menu.submenu {
                     if key == "enter" {
                         if let Some(choice) = menu.submenu_active {
@@ -3121,7 +3117,13 @@ impl Shell {
                     }
                 } else {
                     let group = menu.active.unwrap_or(0);
-                    self.open_sidebar_view_submenu(group, true, cx);
+                    if group == SIDEBAR_VIEW_GROUPS.len() {
+                        if key != "right" && !event.is_held {
+                            self.activate_sidebar_view_row(SidebarViewRow::Compact, cx);
+                        }
+                    } else if key != "space" {
+                        self.open_sidebar_view_submenu(group, true, cx);
+                    }
                 }
             }
             _ => return,
@@ -3148,7 +3150,7 @@ impl Shell {
         let labels = [
             "By device",
             "By project",
-            "In one list",
+            "None",
             "Last updated",
             "Created",
             "Branch",
@@ -3156,7 +3158,6 @@ impl Shell {
             "Harness",
             "Project icon",
             "Location",
-            "Compact mode",
         ];
         let icons = [
             icons::LAPTOP,
@@ -3169,7 +3170,6 @@ impl Shell {
             icons::BOT,
             icons::PROJECT_DEFAULT,
             icons::FOLDER,
-            icons::LIST,
         ];
         let selected = [
             organization == SidebarOrganization::ByDevice,
@@ -3182,21 +3182,16 @@ impl Shell {
             show_harness,
             self.settings.sidebar_show_project_icon,
             self.settings.sidebar_show_project_label,
-            self.settings.sidebar_compact,
         ];
         let values = [
             labels[selected[..3].iter().position(|v| *v).unwrap_or(0)].to_string(),
             labels[3 + selected[3..5].iter().position(|v| *v).unwrap_or(0)].to_string(),
-            format!("{} of 5", selected[5..10].iter().filter(|v| **v).count()),
-            if self.settings.sidebar_compact {
-                "Compact"
-            } else {
-                "Expanded"
-            }
-            .to_string(),
         ];
-        let mut groups = Vec::new();
+        let mut groups: Vec<AnyElement> = Vec::new();
         for (group, (label, range)) in SIDEBAR_VIEW_GROUPS.iter().enumerate() {
+            if group == 2 {
+                groups.push(popover::menu_separator().into_any_element());
+            }
             let open = submenu == Some(group);
             let entity = cx.entity().downgrade();
             let mut trigger = popover::menu_row_nav(
@@ -3227,11 +3222,13 @@ impl Shell {
                 cx.stop_propagation();
             }))
             .child(div().flex_1().child(*label))
-            .child(
-                div()
-                    .text_color(theme.text_muted)
-                    .child(values[group].clone()),
-            )
+            .when(group < values.len(), |el| {
+                el.child(
+                    div()
+                        .text_color(theme.text_muted)
+                        .child(values[group].clone()),
+                )
+            })
             .child(
                 icon(icons::ALT_ARROW_RIGHT)
                     .size(px(12.0))
@@ -3341,9 +3338,44 @@ impl Shell {
                             }));
                         }
                     }))
-                    .child(trigger),
+                    .child(trigger)
+                    .into_any_element(),
             );
         }
+        groups.push(popover::menu_separator().into_any_element());
+        groups.push(
+            popover::menu_row_nav(
+                theme,
+                false,
+                active == Some(SIDEBAR_VIEW_GROUPS.len()),
+                "sidebar-view-compact",
+            )
+            .id("sidebar-view-compact")
+            .h(px(30.0))
+            .py(px(0.0))
+            .on_mouse_move(cx.listener(|this, _, _, cx| {
+                if let Some(menu) = this.sidebar_view_menu.open_mut() {
+                    if menu.submenu.is_some() || menu.active != Some(SIDEBAR_VIEW_GROUPS.len()) {
+                        menu.hover_task = None;
+                        menu.submenu = None;
+                        menu.submenu_active = None;
+                        menu.submenu_bounds = None;
+                        menu.active = Some(SIDEBAR_VIEW_GROUPS.len());
+                        cx.notify();
+                    }
+                }
+            }))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.activate_sidebar_view_row(SidebarViewRow::Compact, cx);
+                cx.stop_propagation();
+            }))
+            .child(div().flex_1().child("Compact"))
+            .child(crate::settings::widgets::toggle_switch(
+                theme,
+                self.settings.sidebar_compact,
+            ))
+            .into_any_element(),
+        );
         popover::popover_card(theme)
             .w(px(self.settings.sidebar_width - 2.0 * Theme::SPACE_SM))
             .track_focus(&focus)
