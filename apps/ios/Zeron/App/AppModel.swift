@@ -153,9 +153,9 @@ final class AppModel {
                     if args.contains("-stream"), let demo {
                         // Screenshot rig: kick off the scripted streaming reply.
                         let store = demo.sessionStore(for: chatId)
-                        Task { @MainActor in
+                        Task { @MainActor [weak store] in
                             try? await Task.sleep(nanoseconds: 2_000_000_000)
-                            store.demoResponder?("Show me the streamed reply path.")
+                            store?.demoResponder?("Show me the streamed reply path.")
                         }
                     }
                 } else if spec.hasPrefix("space:") {
@@ -173,9 +173,9 @@ final class AppModel {
                 let store = demo.sessionStore(for: lateId)
                 let full = store.entries
                 store.setEntries([])
-                Task { @MainActor in
+                Task { @MainActor [weak store] in
                     try? await Task.sleep(nanoseconds: 2_500_000_000)
-                    store.setEntries(full)
+                    store?.setEntries(full)
                 }
             }
             // Animation rig: "-archive-after chatId:secs" / "-unarchive-after
@@ -668,20 +668,23 @@ final class AppModel {
             // Dial-held stores stay held: a kick force-dials, and sweeping 46
             // of them on every foreground/path flap is the stampede the warm
             // cap exists to prevent. Held chats reconnect on open.
-            guard let store = sessionStores[chat.id], !store.isDialHeld else { continue }
+            guard let store = sessionStores[chat.id],
+                  !store.isDialHeld || !store.outbox.isEmpty else { continue }
             kicked.insert(chat.id)
-            scheduleKick(store, afterNs: delay)
+            scheduleKick(chatId: chat.id, afterNs: delay)
             delay += 200_000_000
         }
-        for (id, store) in sessionStores where !kicked.contains(id) && !store.isDialHeld {
-            scheduleKick(store, afterNs: delay)
+        for (id, store) in sessionStores
+            where !kicked.contains(id) && (!store.isDialHeld || !store.outbox.isEmpty) {
+            scheduleKick(chatId: id, afterNs: delay)
             delay += 200_000_000
         }
     }
 
-    private func scheduleKick(_ store: SessionStore, afterNs delay: UInt64) {
-        Task { @MainActor in
+    private func scheduleKick(chatId: String, afterNs delay: UInt64) {
+        Task { @MainActor [weak self] in
             if delay > 0 { try? await Task.sleep(nanoseconds: delay) }
+            guard let self, let store = self.sessionStores[chatId] else { return }
             store.kickRoom()
         }
     }
@@ -737,15 +740,20 @@ final class AppModel {
         if let demo { return demo.sessionStore(for: chat.id) }
         guard let config else { return nil }
         if let existing = sessionStores[chat.id] {
-            touchStore(chat.id)
-            existing.hostDeviceId = chat.deviceId
-            // The registry flip to chat2 can land while the store is open —
-            // views re-derive `chat` from the registry on every change, so
-            // this accessor is the flip's delivery path.
-            existing.updateRoomGen(chat.roomGen)
-            // An open view wants live sync NOW — any preload dial-hold ends.
-            existing.releaseDial()
-            return existing
+            if existing.stopped {
+                sessionStores.removeValue(forKey: chat.id)
+                storeLastUsed.removeValue(forKey: chat.id)
+            } else {
+                touchStore(chat.id)
+                existing.hostDeviceId = chat.deviceId
+                // The registry flip to chat2 can land while the store is open —
+                // views re-derive `chat` from the registry on every change, so
+                // this accessor is the flip's delivery path.
+                existing.updateRoomGen(chat.roomGen)
+                // An open view wants live sync NOW — any preload dial-hold ends.
+                existing.releaseDial()
+                return existing
+            }
         }
         let store = SessionStore(chatId: chat.id, config: config)
         store.hostDeviceId = chat.deviceId
@@ -869,6 +877,24 @@ final class AppModel {
         return ids
     }
 
+    nonisolated static func warmDialIDs(
+        ids: [String],
+        hasPendingOutbox: (String) -> Bool,
+        cap: Int
+    ) -> [String] {
+        let limit = max(0, cap)
+        var released: [String] = []
+        var selected = Set<String>()
+        for id in ids.prefix(limit) where selected.insert(id).inserted {
+            released.append(id)
+        }
+        for id in ids.dropFirst(limit)
+            where hasPendingOutbox(id) && selected.insert(id).inserted {
+            released.append(id)
+        }
+        return released
+    }
+
     nonisolated static func evictionOrder(
         lastUsed: [String: UInt64],
         protected: (String) -> Bool
@@ -929,13 +955,17 @@ final class AppModel {
     func preloadSessions() {
         guard demo == nil, let config else { return }
         var stagger: UInt64 = 0
-        var released = 0
         let preloadIDs = Self.warmPreloadIDs(
             chats: overviewChats,
             hasPendingOutbox: { DocDisk.chat2HasPendingOutbox(id: $0) },
             cap: Self.warmStoreCap
         )
-        for chat in overviewChats where preloadIDs.contains(chat.id) && sessionStores[chat.id] == nil {
+        for chat in overviewChats where preloadIDs.contains(chat.id) {
+            if sessionStores[chat.id]?.stopped == true {
+                sessionStores.removeValue(forKey: chat.id)
+                storeLastUsed.removeValue(forKey: chat.id)
+            }
+            guard sessionStores[chat.id] == nil else { continue }
             let store = SessionStore(chatId: chat.id, config: config)
             store.hostDeviceId = chat.deviceId
             store.hostLiveness = { [weak self] deviceId in
@@ -945,10 +975,18 @@ final class AppModel {
             touchStore(chat.id)
             store.start(holdDial: true)
             store.updateRoomGen(chat.roomGen)
-            guard released < Self.warmDialCap else { continue }
-            released += 1
+        }
+        let warmDialIDs = Self.warmDialIDs(
+            ids: preloadIDs,
+            hasPendingOutbox: { sessionStores[$0]?.outbox.isEmpty == false },
+            cap: Self.warmDialCap
+        )
+        for id in warmDialIDs {
+            guard let chat = overviewChats.first(where: { $0.id == id }),
+                  let store = sessionStores[id], store.isDialHeld else { continue }
             let delay = stagger
-            Task { @MainActor in
+            Task { @MainActor [weak self, weak store] in
+                guard let self else { return }
                 // The registry (the sidebar the user is looking at) gets the
                 // pipe to itself first: on a 240kbps link, warm chat dials
                 // racing the registry's own handshake+state pushed the
@@ -960,6 +998,7 @@ final class AppModel {
                     try? await Task.sleep(nanoseconds: 200_000_000)
                 }
                 if delay > 0 { try? await Task.sleep(nanoseconds: delay) }
+                guard let store, self.sessionStores[chat.id] === store else { return }
                 store.releaseDial()
             }
             stagger += 300_000_000

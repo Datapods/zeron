@@ -1,8 +1,15 @@
+import Loro
 import XCTest
 @testable import Zeron
 
 @MainActor
 final class SessionStoreDurabilityTests: XCTestCase {
+    private func config() -> AppConfig {
+        AppConfig(edgeURL: URL(string: "http://localhost:1")!, mode: .dev,
+                  userId: "u", orgId: "o", deviceId: "phone",
+                  deviceName: "phone", tokens: nil, devBearer: "u@o")
+    }
+
     func testCommitNowSavesImmediatelyAndNotifies() {
         var saves = 0
         var callbacks = 0
@@ -34,5 +41,68 @@ final class SessionStoreDurabilityTests: XCTestCase {
         saver.flush()
         XCTAssertFalse(saver.isDirty)
         XCTAssertEqual(callbacks, 1)
+    }
+
+    func testLocalCommitIsOnDiskBeforeAdmission() async throws {
+        let id = "durable-store-\(UUID().uuidString)"
+        defer { try? FileManager.default.removeItem(at: DocDisk.chat2URL(for: id)) }
+        let store = SessionStore(chatId: id, config: config())
+        store.start()
+        store.updateRoomGen(2)
+        let baseline = Set(store.outbox.map(\.batchId))
+
+        try store.doc.getMap(id: "test").insert(key: "value", v: "durable")
+        store.doc.commit()
+
+        var newBatchIDs: Set<String> = []
+        for _ in 0..<20 {
+            await Task.yield()
+            newBatchIDs = Set(store.outbox.map(\.batchId)).subtracting(baseline)
+            if !newBatchIDs.isEmpty { break }
+        }
+        XCTAssertEqual(newBatchIDs.count, 1)
+        let loaded = try XCTUnwrap(DocDisk.loadChat2(into: LoroDoc(), id: id))
+        XCTAssertTrue(newBatchIDs.isSubset(of: Set(loaded.outbox.map(\.batchId))))
+        XCTAssertTrue(newBatchIDs.isSubset(of: store.admittedBatchIDs))
+        store.stop()
+    }
+
+    func testFailedWriteBlocksAdmissionUntilRetrySucceeds() async throws {
+        let id = "durable-retry-\(UUID().uuidString)"
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("zeron-durable-retry-\(UUID().uuidString)")
+        let blocker = root.appendingPathComponent("blocker")
+        let destination = blocker.appendingPathComponent("dir")
+        let restoredDirectory = root.appendingPathComponent("restored", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try Data("not a directory".utf8).write(to: blocker)
+        defer {
+            DocDisk.directoryOverride = nil
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: DocDisk.chat2URL(for: id))
+        }
+        DocDisk.directoryOverride = destination
+        XCTAssertFalse(DocDisk.saveChat2(doc: LoroDoc(), id: "probe-\(id)", cursor: 0, verified: false))
+
+        let store = SessionStore(chatId: id, config: config())
+        store.start()
+        store.updateRoomGen(2)
+        let baselineCount = store.outbox.count
+        try store.doc.getMap(id: "test").insert(key: "value", v: "retry")
+        store.doc.commit()
+
+        for _ in 0..<20 { await Task.yield() }
+        XCTAssertEqual(store.outbox.count, baselineCount + 1)
+        XCTAssertTrue(store.admittedBatchIDs.isEmpty)
+
+        DocDisk.directoryOverride = restoredDirectory
+        for _ in 0..<35 {
+            if !store.admittedBatchIDs.isEmpty { break }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        XCTAssertEqual(store.admittedBatchIDs, Set(store.outbox.map(\.batchId)))
+        let loaded = try XCTUnwrap(DocDisk.loadChat2(into: LoroDoc(), id: id))
+        XCTAssertEqual(loaded.outbox.map(\.batchId), store.outbox.map(\.batchId))
+        store.stop()
     }
 }

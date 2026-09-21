@@ -8,7 +8,14 @@ import Foundation
 import Loro
 
 enum DocDisk {
+    static var directoryOverride: URL?
+
     static var directory: URL {
+        if let directoryOverride {
+            try? FileManager.default.createDirectory(at: directoryOverride,
+                                                     withIntermediateDirectories: true)
+            return directoryOverride
+        }
         let base = FileManager.default.urls(for: .applicationSupportDirectory,
                                             in: .userDomainMask)[0]
             .appendingPathComponent("ZeronDocs", isDirectory: true)

@@ -19,6 +19,16 @@ final class StoreResidencyTests: XCTestCase {
         XCTAssertEqual(Set(ids.suffix(2)), ["chat-20", "chat-29"])
     }
 
+    func testWarmDialSelectsPendingOutboxChatsBeyondCap() {
+        let ids = (0..<9).map { "chat-\($0)" }
+        let released = AppModel.warmDialIDs(
+            ids: ids,
+            hasPendingOutbox: { $0 == "chat-8" },
+            cap: 8
+        )
+        XCTAssertEqual(released, ids)
+    }
+
     func testEvictionOrderIsLruFirstAndSkipsProtectedStores() {
         let order = AppModel.evictionOrder(
             lastUsed: ["old": 1, "protected": 2, "new": 3, "middle": 4]

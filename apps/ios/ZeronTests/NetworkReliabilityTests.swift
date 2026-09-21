@@ -154,6 +154,28 @@ final class NetworkReliabilityTests: XCTestCase {
     }
 
     @MainActor
+    func testHeldSessionReleasesPendingOutboxToTransport() throws {
+        let id = "held-outbox-\(UUID().uuidString)"
+        let config = AppConfig(edgeURL: URL(string: "http://localhost:1")!, mode: .dev,
+                               userId: "u", orgId: "o", deviceId: "phone",
+                               deviceName: "phone", tokens: nil, devBearer: "u@o")
+        defer { try? FileManager.default.removeItem(at: DocDisk.chat2URL(for: id)) }
+        XCTAssertTrue(DocDisk.saveChat2(doc: LoroDoc(), id: id, cursor: 7, verified: true,
+                                        outbox: [("stable-a", Data([1]))]))
+
+        let store = SessionStore(chatId: id, config: config)
+        store.start(holdDial: true)
+        store.updateRoomGen(2)
+        XCTAssertFalse(store.roomActive)
+        XCTAssertTrue(store.admittedBatchIDs.isEmpty)
+
+        store.releaseDial()
+        XCTAssertTrue(store.roomActive)
+        XCTAssertEqual(store.admittedBatchIDs, ["stable-a"])
+        store.stop()
+    }
+
+    @MainActor
     func testCursorZeroFirstContactPreservesRestoredBatchesAndFlag() throws {
         let id = "first-contact-\(UUID().uuidString)"
         let config = AppConfig(edgeURL: URL(string: "http://localhost:1")!, mode: .dev,

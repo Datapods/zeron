@@ -81,6 +81,8 @@ final class SessionStore {
     /// the registry never walks a chat back to s2.
     @ObservationIgnored private var roomGen = 1
     @ObservationIgnored private var started = false
+    @ObservationIgnored private(set) var stopped = false
+    @ObservationIgnored private var lifecycleGeneration: UInt64 = 0
     /// Preload holds the dial (AppModel staggers the release) so a cold
     /// launch doesn't stampede N TLS handshakes against the registry dial
     /// on a thin link. The disk snapshot still hydrates immediately —
@@ -151,7 +153,7 @@ final class SessionStore {
     @ObservationIgnored private var saver: DocSaver?
 
     func start(holdDial: Bool = false) {
-        guard !started, !offline else { return }
+        guard !stopped, !started, !offline else { return }
         started = true
         self.holdDial = holdDial
         // Local-first: the last-synced chat2 snapshot renders instantly (even
@@ -205,6 +207,7 @@ final class SessionStore {
     /// A gen-1 store connects the moment the host's migration sweep flips
     /// the row.
     func updateRoomGen(_ gen: Int?) {
+        guard !stopped else { return }
         let gen = gen ?? 1
         if gen > roomGen { roomGen = gen }
         connectIfReady()
@@ -217,13 +220,13 @@ final class SessionStore {
     /// End a preload dial-hold: an open view (or the stagger timer) wants
     /// live sync now.
     func releaseDial() {
-        guard holdDial else { return }
+        guard !stopped, holdDial else { return }
         holdDial = false
         connectIfReady()
     }
 
     private func connectIfReady() {
-        guard started, !offline, !holdDial, chatRoom == nil, roomGen >= 2 else { return }
+        guard !stopped, started, !offline, !holdDial, chatRoom == nil, roomGen >= 2 else { return }
         let delegate = ChatRoomClient.Delegate(
             cursor: { [weak self] in self?.cursor ?? 0 },
             containsFrontier: { [weak self] frontier in
@@ -327,10 +330,17 @@ final class SessionStore {
             _ = saver?.commitNow()
             admitDurableBatches()
         }
-        Task { await client.start() }
+        let generation = lifecycleGeneration
+        Task { @MainActor [weak self] in
+            guard let self, !self.stopped,
+                  self.lifecycleGeneration == generation,
+                  self.chatRoom === client else { return }
+            await client.start()
+        }
     }
 
     func retirePush(batchId: String) {
+        guard !stopped else { return }
         let oldCount = outbox.count
         outbox.removeAll { $0.batchId == batchId }
         admitted.remove(batchId)
@@ -340,10 +350,16 @@ final class SessionStore {
     }
 
     private func admitDurableBatches() {
-        guard !outbox.isEmpty, saver?.isDirty == false, let room = chatRoom else { return }
+        guard !stopped, !outbox.isEmpty, saver?.isDirty == false, let room = chatRoom else { return }
+        let generation = lifecycleGeneration
         for push in outbox where !admitted.contains(push.batchId) {
             admitted.insert(push.batchId)
-            Task { await room.enqueue(batchId: push.batchId, update: push.bytes) }
+            Task { @MainActor [weak self] in
+                guard let self, !self.stopped,
+                      self.lifecycleGeneration == generation,
+                      self.chatRoom === room else { return }
+                await room.enqueue(batchId: push.batchId, update: push.bytes)
+            }
         }
     }
 
@@ -402,13 +418,25 @@ final class SessionStore {
     /// ChatRoomClient.kick). Also the catch-all re-check for a roomGen flip
     /// that landed while this store had no open view.
     func kickRoom() {
+        guard !stopped else { return }
         holdDial = false  // a kick is a user/foreground signal: dial now
         connectIfReady()
         guard let chatRoom else { return }
-        Task { await chatRoom.kick() }
+        let generation = lifecycleGeneration
+        Task { @MainActor [weak self] in
+            guard let self, !self.stopped,
+                  self.lifecycleGeneration == generation,
+                  self.chatRoom === chatRoom else { return }
+            await chatRoom.kick()
+        }
     }
 
     func stop() {
+        guard !stopped else { return }
+        stopped = true
+        started = false
+        holdDial = false
+        lifecycleGeneration &+= 1
         subscriptions.removeAll()
         saver?.flush()
         saver?.onSaved = nil
@@ -458,11 +486,13 @@ final class SessionStore {
         }
         projecting = true
         let doc = self.doc
+        let generation = lifecycleGeneration
         Task { @MainActor [weak self] in
             let decoded = await Task.detached(priority: .userInitiated) {
                 Self.decodeEntries(from: doc)
             }.value
-            guard let self else { return }
+            guard let self, !self.stopped,
+                  self.lifecycleGeneration == generation else { return }
             self.projecting = false
             if let decoded {
                 self.apply(decoded.entries, queue: decoded.queue)
@@ -763,7 +793,7 @@ final class SessionStore {
             var backoffMs = Self.transferBackoffBaseMs
             let deadline = nowMs() + Self.attachmentWaitMaxMs
             let totalBytes = max(remaining.reduce(0) { $0 + $1.data.count }, 1)
-            while let self, !pending.isEmpty, nowMs() < deadline {
+            while let self, !self.stopped, !pending.isEmpty, nowMs() < deadline {
                 do {
                     while let transfer = pending.first {
                         let doneBytes = totalBytes - pending.reduce(0) { $0 + $1.data.count }
