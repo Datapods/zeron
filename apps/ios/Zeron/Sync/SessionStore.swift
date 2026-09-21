@@ -92,6 +92,7 @@ final class SessionStore {
     /// on a thin link. The disk snapshot still hydrates immediately —
     /// only the socket waits its turn.
     @ObservationIgnored private var holdDial = false
+    @ObservationIgnored private var leaseToken = 0
 
     /// Demo mode: no room, entries driven externally.
     private let offline: Bool
@@ -161,6 +162,7 @@ final class SessionStore {
     func start(holdDial: Bool = false) {
         guard !stopped, !started, !offline else { return }
         started = true
+        leaseToken = SnapshotLease.claim(chatId)
         self.holdDial = holdDial
         // Local-first: the last-synced chat2 snapshot renders instantly (even
         // when the host device is offline); the join backfills incrementally
@@ -180,6 +182,7 @@ final class SessionStore {
         }
         saver = DocSaver { [weak self] in
             guard let self else { return false }
+            guard SnapshotLease.isCurrent(self.chatId, self.leaseToken) else { return false }
             guard DocDisk.saveChat2(doc: self.doc, id: self.chatId,
                                     cursor: self.cursor,
                                     verified: self.cursorVerified,
@@ -455,6 +458,10 @@ final class SessionStore {
         return await saver.commitAsync(
             export: { [doc] in try? doc.export(mode: .snapshot) },
             write: { [weak self] snapshot in
+                guard let self,
+                      SnapshotLease.isCurrent(chatId, self.leaseToken) else {
+                    return false
+                }
                 guard let written = DocDisk.saveChat2ReturningBytes(
                     snapshot: snapshot,
                     id: chatId,
@@ -465,7 +472,7 @@ final class SessionStore {
                 ) else {
                     return false
                 }
-                self?.snapshotBytes = written
+                self.snapshotBytes = written
                 return true
             }
         )
@@ -506,6 +513,10 @@ final class SessionStore {
                 _ = await saver.commitAsync(
                     export: { try? doc.export(mode: .snapshot) },
                     write: { [weak self] snapshot in
+                        guard let self,
+                              SnapshotLease.isCurrent(chatId, self.leaseToken) else {
+                            return false
+                        }
                         guard let written = DocDisk.saveChat2ReturningBytes(
                             snapshot: snapshot,
                             id: chatId,
@@ -516,7 +527,7 @@ final class SessionStore {
                         ) else {
                             return false
                         }
-                        self?.snapshotBytes = written
+                        self.snapshotBytes = written
                         return true
                     }
                 )
@@ -579,7 +590,7 @@ final class SessionStore {
     ///
     /// Overlapping calls coalesce to a single trailing re-run — a streaming
     /// burst must not queue one whole-doc projection per token.
-    private func project() {
+    func project() {
         guard !projecting else {
             projectPending = true
             return
@@ -608,8 +619,8 @@ final class SessionStore {
                 self.apply(decoded.entries, queue: decoded.queue)
             }
             if self.projectPending {
-                self.projectPending = false
                 if self.viewAttached {
+                    self.projectPending = false
                     self.project()
                 } else {
                     self.scheduleTrailingProjection(after: 1_000_000_000)

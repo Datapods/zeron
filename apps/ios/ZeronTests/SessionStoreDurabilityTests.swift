@@ -10,6 +10,20 @@ final class SessionStoreDurabilityTests: XCTestCase {
                   deviceName: "phone", tokens: nil, devBearer: "u@o")
     }
 
+    private func appendEntry(_ store: SessionStore, id: String, text: String) throws {
+        let list = store.doc.getMovableList(id: "messages")
+        let map = try list.insertMapContainer(pos: list.len(), child: LoroMap())
+        try map.insert(key: "id", v: id)
+        try map.insert(key: "role", v: "assistant")
+        try map.insert(key: "createdAt", v: Int64(1))
+        try map.insert(key: "deviceId", v: "remote")
+        let parts = try map.insertContainer(key: "parts", child: LoroList())
+        let part = try parts.insertMapContainer(pos: 0, child: LoroMap())
+        try part.insert(key: "id", v: "\(id)-part")
+        try part.insert(key: "kind", v: "text")
+        try part.insert(key: "text", v: text)
+    }
+
     func testCommitNowSavesImmediatelyAndNotifies() {
         var saves = 0
         var callbacks = 0
@@ -64,7 +78,7 @@ final class SessionStoreDurabilityTests: XCTestCase {
         XCTAssertEqual(callbacks, 1)
     }
 
-    func testCommitAsyncDropsStaleExport() async {
+    func testCommitAsyncKeepsConsistentStaleExportDirty() async {
         var writes = 0
         let saver = DocSaver { true }
         saver.poke()
@@ -85,7 +99,7 @@ final class SessionStoreDurabilityTests: XCTestCase {
         )
 
         XCTAssertFalse(result)
-        XCTAssertEqual(writes, 0)
+        XCTAssertEqual(writes, 1)
         XCTAssertTrue(saver.isDirty)
     }
 
@@ -235,7 +249,7 @@ final class SessionStoreDurabilityTests: XCTestCase {
         XCTAssertFalse(b.isDirty)
     }
 
-    func testCommitAsyncDropsExportAfterNewPoke() async {
+    func testCommitAsyncWritesOlderSnapshotAfterNewPoke() async {
         let started = expectation(description: "detached export started")
         let gate = DispatchSemaphore(value: 0)
         var wrote = false
@@ -264,7 +278,7 @@ final class SessionStoreDurabilityTests: XCTestCase {
 
         let result = await task.value
         XCTAssertFalse(result)
-        XCTAssertFalse(wrote)
+        XCTAssertTrue(wrote)
         XCTAssertTrue(saver.isDirty)
     }
 
@@ -289,7 +303,14 @@ final class SessionStoreDurabilityTests: XCTestCase {
         let saver = DocSaver(save: {
             saves += 1
             return true
-        }, quietDebounceNs: 5_000_000_000, maxDeferralNs: 400_000_000)
+        }, quietDebounceNs: 5_000_000_000, maxDeferralNs: 400_000_000,
+        staleRetryNs: 400_000_000)
+        var backgroundFlushes = 0
+        saver.background = {
+            backgroundFlushes += 1
+            saves += 1
+            return true
+        }
 
         for _ in 0..<20 {
             saver.poke()
@@ -297,6 +318,53 @@ final class SessionStoreDurabilityTests: XCTestCase {
         }
 
         XCTAssertGreaterThanOrEqual(saves, 1)
+        XCTAssertGreaterThanOrEqual(backgroundFlushes, 1)
+    }
+
+    func testStaleBackgroundExportRearmsBoundedDeadline() async {
+        let started = expectation(description: "deadline export started")
+        let gate = DispatchSemaphore(value: 0)
+        var exports = 0
+        var writes = 0
+        var callbacks = 0
+        let saver = DocSaver(save: { true },
+                             quietDebounceNs: 5_000_000_000,
+                             maxDeferralNs: 100_000_000,
+                             staleRetryNs: 300_000_000)
+        saver.onSaved = { callbacks += 1 }
+        saver.background = {
+            await saver.commitAsync(
+                export: {
+                    exports += 1
+                    if exports == 1 {
+                        started.fulfill()
+                        gate.wait()
+                    }
+                    return Data([UInt8(exports)])
+                },
+                write: { _ in
+                    writes += 1
+                    return true
+                }
+            )
+        }
+
+        saver.poke()
+        await fulfillment(of: [started], timeout: 1)
+        saver.poke()
+        gate.signal()
+        try? await Task.sleep(nanoseconds: 100_000_000)
+
+        XCTAssertEqual(writes, 1)
+        XCTAssertTrue(saver.isDirty)
+        XCTAssertEqual(callbacks, 0)
+
+        let deadline = Date().addingTimeInterval(1.5)
+        while Date() < deadline, writes < 2 {
+            saver.poke()
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        XCTAssertGreaterThanOrEqual(writes, 2)
     }
 
     func testDebounceUsesBackgroundHook() async {
@@ -434,6 +502,120 @@ final class SessionStoreDurabilityTests: XCTestCase {
         XCTAssertEqual(store.admittedBatchIDs, Set(store.outbox.map(\.batchId)))
         let loaded = try XCTUnwrap(DocDisk.loadChat2(into: LoroDoc(), id: id))
         XCTAssertEqual(loaded.outbox.map(\.batchId), store.outbox.map(\.batchId))
+        store.stop()
+    }
+
+    func testStoppedStoreCannotWriteAfterWipe() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("zeron-lease-wipe-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        DocDisk.directoryOverride = root
+        defer {
+            DocDisk.directoryOverride = nil
+            try? FileManager.default.removeItem(at: root)
+        }
+
+        let gate = DispatchSemaphore(value: 0)
+        let started = expectation(description: "blocking export started")
+        let blocker = Task {
+            await SnapshotExporter.shared.export {
+                started.fulfill()
+                gate.wait()
+                return Data([0])
+            }
+        }
+        await fulfillment(of: [started], timeout: 1)
+
+        let id = "lease-wipe-\(UUID().uuidString)"
+        let store = SessionStore(chatId: id, config: config())
+        store.start(holdDial: true)
+        try appendEntry(store, id: "first", text: "dirty")
+        store.doc.commit()
+        for _ in 0..<20 {
+            await Task.yield()
+            if store.outbox.count == 1 { break }
+        }
+        store.stop()
+        DocDisk.wipeAll()
+        gate.signal()
+        _ = await blocker.value
+        try await Task.sleep(for: .milliseconds(100))
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: DocDisk.chat2URL(for: id).path))
+    }
+
+    func testReplacementStoreWinsOverStoppedStoreExport() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("zeron-lease-replacement-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let blockerFile = root.appendingPathComponent("blocker")
+        let destination = blockerFile.appendingPathComponent("dir")
+        try Data("not a directory".utf8).write(to: blockerFile)
+        DocDisk.directoryOverride = destination
+        defer {
+            DocDisk.directoryOverride = nil
+            try? FileManager.default.removeItem(at: root)
+        }
+
+        let gate = DispatchSemaphore(value: 0)
+        let started = expectation(description: "blocking export started")
+        let exportBlocker = Task {
+            await SnapshotExporter.shared.export {
+                started.fulfill()
+                gate.wait()
+                return Data([0])
+            }
+        }
+        await fulfillment(of: [started], timeout: 1)
+
+        let id = "lease-replacement-\(UUID().uuidString)"
+        let old = SessionStore(chatId: id, config: config())
+        old.start(holdDial: true)
+        try appendEntry(old, id: "old", text: "old")
+        old.doc.commit()
+        for _ in 0..<20 {
+            await Task.yield()
+            if old.outbox.count == 1 { break }
+        }
+        old.stop()
+
+        DocDisk.directoryOverride = root
+        let replacement = SessionStore(chatId: id, config: config())
+        replacement.start(holdDial: true)
+        try appendEntry(replacement, id: "new", text: "new")
+        replacement.doc.commit()
+        for _ in 0..<20 {
+            await Task.yield()
+            if replacement.outbox.count == 1 { break }
+        }
+        XCTAssertEqual(replacement.outbox.count, 1)
+        replacement.flushToDisk()
+
+        gate.signal()
+        _ = await exportBlocker.value
+        try await Task.sleep(for: .milliseconds(100))
+        let loaded = try XCTUnwrap(DocDisk.loadChat2(into: LoroDoc(), id: id))
+        XCTAssertEqual(loaded.outbox.map(\.batchId), replacement.outbox.map(\.batchId))
+        replacement.stop()
+    }
+
+    func testDetachedProjectionRetainsTrailingUpdate() async throws {
+        let id = "projection-trailing-\(UUID().uuidString)"
+        let store = SessionStore(chatId: id, config: config())
+        try appendEntry(store, id: "first", text: "first")
+        store.doc.commit()
+        store.start(holdDial: true)
+        for _ in 0..<50 where !store.entries.contains(where: { $0.id == "first" }) {
+            await Task.yield()
+        }
+        try appendEntry(store, id: "second", text: "second")
+        store.doc.commit()
+        store.project()
+        try await Task.sleep(for: .milliseconds(1_300))
+        XCTAssertTrue(store.entries.contains { entry in
+            entry.id == "second"
+        })
         store.stop()
     }
 }

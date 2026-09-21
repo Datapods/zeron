@@ -7,6 +7,27 @@
 import Foundation
 import Loro
 
+@MainActor
+enum SnapshotLease {
+    private static var leases: [String: Int] = [:]
+    private static var epoch = 0
+
+    static func claim(_ chatId: String) -> Int {
+        epoch &+= 1
+        leases[chatId] = epoch
+        return epoch
+    }
+
+    static func isCurrent(_ chatId: String, _ token: Int) -> Bool {
+        leases[chatId] == token
+    }
+
+    static func revokeAll() {
+        epoch &+= 1
+        leases.removeAll()
+    }
+}
+
 enum DocDisk {
     static var directoryOverride: URL?
 
@@ -314,7 +335,9 @@ enum DocDisk {
     }
 
     /// Sign-out hygiene: local doc state belongs to the signed-in identity.
+    @MainActor
     static func wipeAll() {
+        SnapshotLease.revokeAll()
         try? FileManager.default.removeItem(at: directory)
     }
 }
@@ -328,8 +351,10 @@ final class DocSaver {
     private let save: () -> Bool
     private let quietDebounceNs: UInt64
     private let maxDeferralNs: UInt64
+    private let staleRetryNs: UInt64
     private var generation = 0
     private var deadlineGeneration = 0
+    private var syncCommits = 0
     private var dirty = false
     var onSaved: (() -> Void)?
     var background: (() async -> Bool)?
@@ -337,10 +362,12 @@ final class DocSaver {
 
     init(save: @escaping () -> Bool,
          quietDebounceNs: UInt64 = 5_000_000_000,
-         maxDeferralNs: UInt64 = 300_000_000_000) {
+         maxDeferralNs: UInt64 = 300_000_000_000,
+         staleRetryNs: UInt64 = 30_000_000_000) {
         self.save = save
         self.quietDebounceNs = quietDebounceNs
         self.maxDeferralNs = maxDeferralNs
+        self.staleRetryNs = staleRetryNs
     }
 
     func retireTimers() {
@@ -356,9 +383,22 @@ final class DocSaver {
                 generation += 1
                 deadlineGeneration += 1
                 onSaved?()
+            } else if dirty {
+                armDeadline(after: min(maxDeferralNs, staleRetryNs))
             }
         } else {
             flush()
+        }
+    }
+
+    private func armDeadline(after delay: UInt64) {
+        deadlineGeneration += 1
+        let expectedDeadline = deadlineGeneration
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: delay)
+            guard let self, self.deadlineGeneration == expectedDeadline,
+                  self.dirty else { return }
+            await self.flushFromTimer()
         }
     }
 
@@ -368,14 +408,7 @@ final class DocSaver {
         generation += 1
         let expected = generation
         if !wasDirty {
-            deadlineGeneration += 1
-            let expectedDeadline = deadlineGeneration
-            Task { @MainActor [weak self] in
-                try? await Task.sleep(nanoseconds: self?.maxDeferralNs ?? 0)
-                guard let self, self.deadlineGeneration == expectedDeadline,
-                      self.dirty else { return }
-                await self.flushFromTimer()
-            }
+            armDeadline(after: maxDeferralNs)
         }
         Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: self?.quietDebounceNs ?? 0)
@@ -391,6 +424,7 @@ final class DocSaver {
 
     @discardableResult
     func commitNow() -> Bool {
+        syncCommits &+= 1
         guard save() else {
             dirty = true
             scheduleRetry()
@@ -407,10 +441,16 @@ final class DocSaver {
     func commitAsync(export: @escaping @Sendable () -> Data?,
                      write: @escaping (Data) -> Bool) async -> Bool {
         guard dirty else { return true }
+        let syncCommitsAtStart = syncCommits
         generation += 1
         let expected = generation
         let snapshot = await SnapshotExporter.shared.export(export)
-        guard generation == expected else { return false }
+        if generation != expected {
+            if syncCommits == syncCommitsAtStart, let snapshot {
+                _ = write(snapshot)
+            }
+            return false
+        }
         guard let snapshot, write(snapshot) else {
             dirty = true
             scheduleRetry()
