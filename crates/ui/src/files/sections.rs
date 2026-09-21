@@ -152,6 +152,9 @@ pub(super) struct SubagentRow {
     pub doc_id: String,
     pub title: SharedString,
     pub status: Option<SubagentStatus>,
+    /// When the spawning turn was written — the closest thing a subagent
+    /// has to a start time.
+    pub spawned_at: DateTime<Utc>,
 }
 
 impl SubagentRow {
@@ -183,6 +186,8 @@ pub(super) fn subagent_rows(state: &AppState, chat_id: &str) -> Vec<SubagentRow>
     }
     let mut rows: Vec<SubagentRow> = Vec::new();
     for entry in &state.transcript {
+        let spawned_at =
+            DateTime::<Utc>::from_timestamp_millis(entry.created_at).unwrap_or_else(Utc::now);
         for part in &entry.parts {
             let MessagePart::Tool {
                 call,
@@ -200,6 +205,7 @@ pub(super) fn subagent_rows(state: &AppState, chat_id: &str) -> Vec<SubagentRow>
                 doc_id: doc_id.clone(),
                 title: crate::transcript::subagent_tab_title(call),
                 status: *subagent_status,
+                spawned_at,
             };
             match rows.iter_mut().find(|r| r.doc_id == row.doc_id) {
                 // A reopened (steered) subagent updates its row in place.
@@ -509,6 +515,7 @@ impl FilesSurface {
         if rows.is_empty() {
             return empty_row(Section::Subagents, theme);
         }
+        let now = Utc::now();
         let mut list = row_list("files-subagent-rows");
         for row in rows {
             let glyph = status_glyph(
@@ -531,7 +538,11 @@ impl FilesSurface {
                         });
                     }))
                     .child(glyph)
-                    .child(row_title(row.title.clone())),
+                    .child(row_title(row.title.clone()))
+                    .child(time_ago_label(
+                        zeron_proto::view::format_time_ago(row.spawned_at, now).into(),
+                        theme,
+                    )),
             );
         }
         list.into_any_element()
@@ -566,13 +577,7 @@ impl FilesSurface {
                     }))
                     .child(glyph)
                     .child(row_title(row.title.clone()))
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(crate::typography::ui_rems(11.0))
-                            .text_color(theme.text_muted.opacity(0.5))
-                            .child(row.time_ago.clone()),
-                    ),
+                    .child(time_ago_label(row.time_ago.clone(), theme)),
             );
         }
         list.into_any_element()
@@ -626,6 +631,15 @@ fn compact_row(id: String, theme: &Theme) -> gpui::Stateful<gpui::Div> {
         .cursor_pointer()
         .text_color(theme.text.opacity(0.8))
         .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text))
+}
+
+/// The compact row's trailing time, 11px in the faded subline color.
+fn time_ago_label(text: SharedString, theme: &Theme) -> gpui::Div {
+    div()
+        .flex_none()
+        .text_size(crate::typography::ui_rems(11.0))
+        .text_color(theme.text_muted.opacity(0.5))
+        .child(text)
 }
 
 fn row_title(title: SharedString) -> gpui::Div {
@@ -723,7 +737,7 @@ mod tests {
             id: "e1".into(),
             role: MessageRole::Assistant,
             parts,
-            created_at: 0,
+            created_at: (Utc::now() - chrono::Duration::minutes(3)).timestamp_millis(),
             device_id: "dev".into(),
             status: Some(MessageStatus::Complete),
             continuation_of: None,
@@ -766,6 +780,8 @@ mod tests {
         assert_eq!(rows[0].title.as_ref(), "verify");
         assert!(!rows[0].frozen());
         assert!(rows[1].frozen());
+        // Spawn time comes from the turn that carried the chip.
+        assert!((Utc::now() - rows[0].spawned_at).num_minutes() >= 2);
         // Another chat's explorer sees nothing of this transcript.
         assert!(subagent_rows(&state, "other").is_empty());
     }
