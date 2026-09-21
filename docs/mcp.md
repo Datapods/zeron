@@ -44,10 +44,34 @@ require `parent_chat_id == None`. Children remain addressable by id, deep
 link, and every MCP tool; `list_chats { parent }` is how an orchestrator
 finds them.
 
-Nothing is injected yet: every harness still launches with an empty MCP config
-(`claude/mod.rs --strict-mcp-config`, ACP `session/new mcpServers: []`, codex
-`mcp_servers.*.enabled = false`). Wiring the injection per harness is the
-follow-up; the env contract above is what it will set.
+### Injection
+
+The host engine stamps this server onto every run it drives
+(`RunRequest.mcp`, additive): the same `zeron` binary with `args: ["mcp"]`
+and the three variables above, pointed at the port the engine itself serves
+(never a port it lost the bind race for). Each driver spells it in its own
+dialect and leaves the user's configured servers alone:
+
+| Harness | Where |
+| ------- | ----- |
+| Claude  | `--mcp-config <inline json>` (no `--strict-mcp-config`)             |
+| ACP (Gemini, OpenCode, Pi, …) | `session/new` → `mcpServers: [{name, command, args, env}]` |
+| Codex   | `thread/start` config overrides `mcp_servers.zeron.{command,args,env}` |
+| Cursor  | no per-invocation hook; not injected                              |
+
+Title runs never carry it. A run with no served port (embedded engine that
+lost the bind) gets no Zeron tools rather than a dead server.
+
+### Forks and the explorer
+
+`ForkSideChat { chatId, sourceChatId, parentChatId? }` copies a chat's
+history through its latest completed response into a new chat and appends
+a `fork` part (a system entry: `sourceChatId`, `sourceTitle`) as the seam;
+the transcript draws it as "This chat was forked from <title>". `parentChatId`
+defaults to the source; a side chat's own fork button passes its parent so
+the copy lists as a sibling. The file explorer's footer lists a chat's
+**Subagents** (its spawn chips) and **Chats** (its children: forks and
+`create_chat` spawns) and opens either in the right pane.
 
 ## Tools
 

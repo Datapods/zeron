@@ -1930,6 +1930,27 @@ fn initialize_params(harness: HarnessId) -> Value {
     })
 }
 
+/// `session/new` `mcpServers` for an injected server: ACP spells a stdio
+/// server as name/command/args plus `[{name, value}]` env pairs. Empty when
+/// the host injected nothing — the user's own servers come from the agent's
+/// config, never from here.
+fn acp_mcp_servers(mcp: Option<&zeron_proto::McpServer>) -> Vec<Value> {
+    mcp.into_iter()
+        .map(|mcp| {
+            json!({
+                "name": mcp.name,
+                "command": mcp.command,
+                "args": mcp.args,
+                "env": mcp
+                    .env
+                    .iter()
+                    .map(|(name, value)| json!({ "name": name, "value": value }))
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect()
+}
+
 /// `initialize._meta.steering.supported` — the `_session/steering` extension
 /// both org-maintained adapters advertise (not part of the v1 spec).
 fn steering_supported(init: &Value) -> bool {
@@ -2865,7 +2886,10 @@ async fn run_session(session: Session) {
         let steer_ext = steering_supported(&init);
         let init_commands = scan_available_commands(&init);
 
-        let session_params = json!({ "cwd": request.cwd, "mcpServers": [] });
+        let session_params = json!({
+            "cwd": request.cwd,
+            "mcpServers": acp_mcp_servers(request.mcp.as_ref()),
+        });
         let (session_id, mut session_response) = if let Some(resume) = &request.resume {
             let mut load = session_params.clone();
             load["sessionId"] = Value::String(resume.clone());
@@ -5014,4 +5038,32 @@ fn explicit_program_launches_do_not_get_archive_scratch_roots() {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-antigravity-acp.sh"),
     );
     assert!(harness.adapter_scratch().unwrap().is_none());
+}
+
+#[cfg(test)]
+mod mcp_injection_tests {
+    use super::*;
+
+    #[test]
+    fn acp_mcp_servers_spell_env_as_name_value_pairs_and_default_empty() {
+        assert!(acp_mcp_servers(None).is_empty());
+        let mcp = zeron_proto::McpServer {
+            name: "zeron".into(),
+            command: "/opt/zeron/zeron".into(),
+            args: vec!["mcp".into()],
+            env: [("ZERON_IPC_PORT".to_owned(), "27654".to_owned())]
+                .into_iter()
+                .collect(),
+        };
+        let servers = acp_mcp_servers(Some(&mcp));
+        assert_eq!(
+            servers,
+            vec![json!({
+                "name": "zeron",
+                "command": "/opt/zeron/zeron",
+                "args": ["mcp"],
+                "env": [{ "name": "ZERON_IPC_PORT", "value": "27654" }],
+            })]
+        );
+    }
 }

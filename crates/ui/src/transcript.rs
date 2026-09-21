@@ -1024,6 +1024,12 @@ pub enum RowKind {
     ErrorChip {
         message: SharedString,
     },
+    /// The fork seam: a labeled divider between copied history and the
+    /// chat's own turns.
+    ForkMarker {
+        source_chat_id: SharedString,
+        source_title: SharedString,
+    },
 }
 
 fn generated_image_devices(owner: &str, fallback: &[String]) -> Vec<String> {
@@ -1511,6 +1517,24 @@ pub fn rows_for_entry(
                             kind: RowKind::ErrorChip {
                                 // Harness-generated; the chip is one line.
                                 message: single_line(message).into(),
+                            },
+                            entry_id: entry_id.clone(),
+                            timestamp: None,
+                            copy_text: None,
+                        });
+                    }
+                    MessagePart::Fork {
+                        id: part_id,
+                        source_chat_id,
+                        source_title,
+                    } => {
+                        rows.push(Row {
+                            id: format!("{}#{}", entry.id, part_id).into(),
+                            version: fnv1a(source_title.as_bytes()),
+                            turn_start: false,
+                            kind: RowKind::ForkMarker {
+                                source_chat_id: source_chat_id.clone().into(),
+                                source_title: single_line(source_title).into(),
                             },
                             entry_id: entry_id.clone(),
                             timestamp: None,
@@ -6031,6 +6055,7 @@ impl Transcript {
                 mime_type,
             } => self.render_generated_image(&row.id, owner, path, name, mime_type, cx),
             RowKind::ErrorChip { message } => error_chip(message.clone(), &theme),
+            RowKind::ForkMarker { source_title, .. } => fork_marker(source_title.clone(), &theme),
         };
 
         // Hover-revealed metadata strip: a RESERVED 32px lane under the
@@ -7030,6 +7055,47 @@ fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
         .into_any_element()
 }
 
+/// The fork seam: a dashed rule broken by "This chat was forked from
+/// <source>", the source title in the body color so the eye lands on where
+/// the history came from. Quiet on purpose — it is orientation, not content.
+fn fork_marker(source_title: SharedString, theme: &Theme) -> AnyElement {
+    let rule = || {
+        div()
+            .flex_1()
+            .h_0()
+            .border_t_1()
+            .border_dashed()
+            .border_color(theme.border)
+    };
+    div()
+        .py(px(14.0))
+        .w_full()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(12.0))
+        .child(rule())
+        .child(
+            div()
+                .flex_none()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(4.0))
+                .text_size(crate::typography::ui_rems(13.0))
+                .text_color(theme.text_muted.opacity(0.7))
+                .child("This chat was forked from")
+                .child(
+                    div()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme.text_muted)
+                        .child(source_title),
+                ),
+        )
+        .child(rule())
+        .into_any_element()
+}
+
 /// A passive one-line chip marking a question the agent asked — the
 /// interactive controls live in the composer (chat-view.tsx `InputChip`):
 /// 34px row, `rounded-[10px] border-white/[0.08] bg-white/[0.045] px-2
@@ -7629,7 +7695,7 @@ fn strip_spawn_prefix(text: &str) -> &str {
 /// a fixed-width tab spent on "Agent: " never shows the task, so the genus
 /// is stripped here and the call input's description/prompt fields back up
 /// a bare name (older docs); "Subagent" only as the last resort.
-fn subagent_tab_title(call: &ToolCall) -> SharedString {
+pub(crate) fn subagent_tab_title(call: &ToolCall) -> SharedString {
     let (name, input) = match call {
         ToolCall::Unknown { name, input } => (name.as_str(), input.as_ref()),
         ToolCall::Mcp { tool, input, .. } => (tool.as_str(), input.as_ref()),

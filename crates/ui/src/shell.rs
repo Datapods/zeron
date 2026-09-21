@@ -63,10 +63,10 @@ mod actions_ui;
 mod command_palette;
 mod files_panel;
 mod project_icon;
+mod side_chats;
 mod sidebar_pins;
 mod sidebar_sections;
-mod side_chats;
-mod spaces;
+pub(crate) mod spaces;
 use side_chats::SideChatTab;
 mod tabs;
 
@@ -3077,6 +3077,11 @@ impl Shell {
                     FilesEvent::CloseReady => {
                         this.on_file_close_ready(RightSurface::File(id), &event_panel_key, cx)
                     }
+                    // Footer rows exist on the explorer only; an editor
+                    // surface never emits them.
+                    FilesEvent::OpenSubagent { .. }
+                    | FilesEvent::OpenChildChat(_)
+                    | FilesEvent::NewChildChat => {}
                     FilesEvent::CloseCancelled => {
                         this.cancel_file_close(RightSurface::File(id), cx)
                     }

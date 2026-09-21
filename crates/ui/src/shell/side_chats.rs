@@ -23,17 +23,32 @@ impl Shell {
         }
     }
 
+    /// The surface picker's "Side chat": fork the current conversation
+    /// through its latest completed response, as a child of it.
     pub(super) fn create_side_chat(&mut self, cx: &mut Context<Self>) {
-        if self.side_chat_creating {
-            return;
-        }
-        let state = self.state.read(cx);
-        let Some(source) = state.selected_chat_row().cloned() else {
+        let Some(source) = self.state.read(cx).selected_chat_row().cloned() else {
             self.side_chat_error = Some("Start a conversation before creating a side chat.".into());
             cx.notify();
             return;
         };
-        let Some(engine) = state.engine().cloned() else {
+        let parent = source.id.clone();
+        self.fork_chat(source, parent, cx);
+    }
+
+    /// Fork `source` through its latest completed response into a new chat
+    /// hanging under `parent_id`, and open it in the right pane. A side
+    /// chat's own fork button passes its parent so the copy lists as a
+    /// sibling; the picker passes the source itself.
+    pub(super) fn fork_chat(
+        &mut self,
+        source: zeron_proto::Chat,
+        parent_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self.side_chat_creating {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
         let key = self.panel_key(cx);
@@ -42,6 +57,7 @@ impl Shell {
         let params = serde_json::json!({
             "chatId": uuid::Uuid::new_v4().to_string(),
             "sourceChatId": source.id,
+            "parentChatId": parent_id,
             "targetDeviceId": source.device_id,
         });
         cx.spawn(async move |this, cx| {
@@ -72,7 +88,89 @@ impl Shell {
         cx.notify();
     }
 
-    fn open_side_chat(&mut self, chat: zeron_proto::Chat, key: String, cx: &mut Context<Self>) {
+    /// A fresh, empty side chat under `parent_id` (the active chat when
+    /// None), opened in the right pane ready for its first message. Same
+    /// shape the Zeron MCP server's `create_chat` mints, so agent-spawned
+    /// and hand-started side chats list together.
+    pub(super) fn create_child_chat(&mut self, parent_id: Option<String>, cx: &mut Context<Self>) {
+        if self.side_chat_creating {
+            return;
+        }
+        let state = self.state.read(cx);
+        let parent = match parent_id {
+            Some(id) => state.chats.iter().find(|c| c.id == id).cloned(),
+            None => state.selected_chat_row().cloned(),
+        };
+        let Some(parent) = parent else {
+            self.side_chat_error = Some("Start a conversation before creating a side chat.".into());
+            cx.notify();
+            return;
+        };
+        let Some(engine) = state.engine().cloned() else {
+            return;
+        };
+        let key = self.panel_key(cx);
+        let mut chat = parent.clone();
+        chat.id = uuid::Uuid::new_v4().to_string();
+        chat.parent_chat_id = Some(parent.id.clone());
+        chat.title = None;
+        chat.archived = false;
+        chat.created_at = Utc::now();
+        chat.last_message_at = None;
+        chat.last_message_preview = None;
+        chat.last_seen_at = None;
+        chat.harness_session_id = None;
+        chat.harness_session_cwd = None;
+        chat.room_gen = Some(2);
+        let params = serde_json::json!({
+            "op": "createChat",
+            "chatId": chat.id,
+            "deviceId": chat.device_id,
+            "spaceId": chat.space_id,
+            "config": chat.config,
+            "branch": chat.branch,
+            "cwd": chat.cwd,
+            "parentChatId": parent.id,
+        });
+        self.side_chat_creating = true;
+        self.side_chat_error = None;
+        cx.spawn(async move |this, cx| {
+            let result = engine.client().call(methods::MUTATE, params).await;
+            let _ = this.update(cx, |this, cx| {
+                this.side_chat_creating = false;
+                match result {
+                    Ok(_) => this.open_side_chat(chat, key, cx),
+                    Err(error) => this.side_chat_error = Some(error.to_string().into()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Open an existing side chat (a footer row) in the right pane.
+    pub(super) fn open_child_chat_tab(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+        let Some(chat) = self
+            .state
+            .read(cx)
+            .chats
+            .iter()
+            .find(|c| c.id == chat_id)
+            .cloned()
+        else {
+            return;
+        };
+        let key = self.panel_key(cx);
+        self.open_side_chat(chat, key, cx);
+    }
+
+    pub(super) fn open_side_chat(
+        &mut self,
+        chat: zeron_proto::Chat,
+        key: String,
+        cx: &mut Context<Self>,
+    ) {
         if let Some((&id, _)) = self
             .side_chats
             .iter()
@@ -335,6 +433,8 @@ impl Shell {
         };
         let transcript = tab.transcript.clone();
         let composer = tab.composer.clone();
+        let chat = tab.state.read(cx).selected_chat_row().cloned();
+        let header = self.render_side_chat_header(id, chat.as_ref(), cx);
         let pill = transcript.read(cx).jump_button_shown().then(|| {
             div()
                 .absolute()
@@ -354,23 +454,111 @@ impl Shell {
             .size_full()
             .flex()
             .flex_col()
+            .child(header)
             .child(
                 div()
                     .flex_1()
                     .min_h_0()
                     .relative()
-                    .child(
-                        crate::edge_fade::edge_faded(
-                            Theme::TRANSCRIPT_FADE_BAND,
-                            true,
-                            false,
-                            div().size_full().child(transcript),
-                        )
-                        .inset_top(Theme::TITLEBAR_HEIGHT),
-                    )
+                    .child(crate::edge_fade::edge_faded(
+                        Theme::TRANSCRIPT_FADE_BAND,
+                        true,
+                        false,
+                        div().size_full().child(transcript),
+                    ))
                     .children(pill),
             )
             .child(div().flex_none().child(composer))
+            .into_any_element()
+    }
+
+    /// The side chat's header, under the tab strip: its title, then "+" (a
+    /// fresh sibling chat, opened in a new tab) and fork (copy this chat's
+    /// history into a sibling). Both land under the same parent, so the
+    /// explorer's Chats section lists the whole family together.
+    fn render_side_chat_header(
+        &self,
+        id: u64,
+        chat: Option<&zeron_proto::Chat>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = Theme::of(cx).clone();
+        let title: SharedString = chat
+            .map(|chat| {
+                chat.title
+                    .clone()
+                    .or_else(|| chat.last_message_preview.clone())
+                    .unwrap_or_else(|| "New side chat".into())
+            })
+            .unwrap_or_else(|| "Side chat".into())
+            .into();
+        let parent_id = chat.and_then(|chat| chat.parent_chat_id.clone());
+        let source = chat.cloned();
+        let fork_parent = parent_id
+            .clone()
+            .or_else(|| source.as_ref().map(|c| c.id.clone()));
+        let busy = self.side_chat_creating;
+        div()
+            .id(SharedString::from(format!("side-chat-header-{id}")))
+            .flex_none()
+            .w_full()
+            .pt(px(Theme::TITLEBAR_HEIGHT))
+            .h(px(Theme::TITLEBAR_HEIGHT + 36.0))
+            .px(px(12.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(4.0))
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(crate::typography::ui_rems(12.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text.opacity(0.85))
+                    .child(title),
+            )
+            .children(self.side_chat_error.clone().map(|error| {
+                div()
+                    .flex_none()
+                    .max_w(px(220.0))
+                    .truncate()
+                    .text_size(crate::typography::ui_rems(11.0))
+                    .text_color(theme.danger)
+                    .child(error)
+            }))
+            .child(
+                header_icon_button(
+                    "side-chat-new",
+                    icons::PLUS,
+                    &theme,
+                    cx.listener(move |this, _, _, cx| {
+                        this.create_child_chat(parent_id.clone(), cx);
+                    }),
+                )
+                .role(gpui::Role::Button)
+                .aria_label("New chat in this session")
+                .when(busy, |el| el.opacity(0.4)),
+            )
+            .child(
+                header_icon_button(
+                    "side-chat-fork",
+                    icons::GIT_BRANCH,
+                    &theme,
+                    cx.listener(move |this, _, _, cx| {
+                        if let (Some(source), Some(parent)) = (source.clone(), fork_parent.clone())
+                        {
+                            this.fork_chat(source, parent, cx);
+                        }
+                    }),
+                )
+                .role(gpui::Role::Button)
+                .aria_label("Fork this chat")
+                .when(busy, |el| el.opacity(0.4)),
+            )
             .into_any_element()
     }
 }

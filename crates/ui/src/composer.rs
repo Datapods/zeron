@@ -6527,6 +6527,7 @@ impl Composer {
                     .is_some();
                 let command = SessionCommandPayload::Run {
                     request: RunRequest {
+                        mcp: None,
                         prompt: content.clone(),
                         harness: resolved.harness,
                         model: resolved.model.clone(),

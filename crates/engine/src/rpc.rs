@@ -1475,8 +1475,18 @@ impl RpcService for EngineRpc {
                 struct ForkParams {
                     chat_id: String,
                     source_chat_id: String,
+                    /// Where the fork hangs in the tree. Defaults to the
+                    /// source; a side chat's own fork button passes the
+                    /// side chat's parent so the copy lists as a sibling.
+                    #[serde(default)]
+                    parent_chat_id: Option<String>,
                 }
                 let p: ForkParams = parse_params(params)?;
+                let parent_chat_id = p
+                    .parent_chat_id
+                    .clone()
+                    .filter(|id| !id.trim().is_empty())
+                    .unwrap_or_else(|| p.source_chat_id.clone());
                 let failed = |e: crate::EngineError| RpcError::Failed(e.to_string());
                 let source = self
                     .workspace
@@ -1489,7 +1499,7 @@ impl RpcService for EngineRpc {
                     ));
                 }
                 if let Some(existing) = self.workspace.chat(&p.chat_id).map_err(failed)? {
-                    if existing.parent_chat_id.as_deref() == Some(&p.source_chat_id) {
+                    if existing.parent_chat_id.as_deref() == Some(parent_chat_id.as_str()) {
                         return RpcReply::value(&existing);
                     }
                     return Err(RpcError::Failed("Chat id already exists".into()));
@@ -1512,7 +1522,7 @@ impl RpcService for EngineRpc {
                     })?;
                 let mut chat = source.clone();
                 chat.id = p.chat_id;
-                chat.parent_chat_id = Some(source.id);
+                chat.parent_chat_id = Some(parent_chat_id);
                 chat.title = None; // First side-chat turn receives its own generated title.
                 chat.archived = false;
                 chat.created_at = chrono::Utc::now();
@@ -1544,6 +1554,33 @@ impl RpcService for EngineRpc {
                     target
                         .doc()
                         .push_message(&entry)
+                        .map_err(|e| RpcError::Failed(e.to_string()))?;
+                }
+                // The seam: everything above came from the source. Its own
+                // entry (system role, complete) so the copied history and the
+                // fork's first turn never share a row.
+                let marker_id = format!("fork:{}", chat.id);
+                if !existing.iter().any(|e| e.id == marker_id) {
+                    let source_title = source
+                        .title
+                        .clone()
+                        .or_else(|| source.last_message_preview.clone())
+                        .unwrap_or_else(|| "New session".into());
+                    target
+                        .doc()
+                        .push_message(&zeron_doc::SessionMessageEntry {
+                            id: marker_id.clone(),
+                            role: zeron_doc::MessageRole::System,
+                            parts: vec![zeron_doc::MessagePart::Fork {
+                                id: marker_id,
+                                source_chat_id: source.id.clone(),
+                                source_title,
+                            }],
+                            created_at: chrono::Utc::now().timestamp_millis(),
+                            device_id: self.doc_host.device_id().to_owned(),
+                            status: Some(zeron_doc::MessageStatus::Complete),
+                            continuation_of: None,
+                        })
                         .map_err(|e| RpcError::Failed(e.to_string()))?;
                 }
                 self.doc_host.persist_fork(&target).map_err(failed)?;

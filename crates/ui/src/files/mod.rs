@@ -28,6 +28,7 @@ mod markdown_preview;
 pub mod model;
 pub mod preview;
 pub mod search;
+mod sections;
 pub mod tree;
 pub mod watch;
 
@@ -143,11 +144,24 @@ pub enum FilesEvent {
     RevealFile(String),
     OpenWebLink(crate::markdown::render::LinkActivation),
     TitleChanged,
-    FileRenamed { old_path: String, new_path: String },
+    FileRenamed {
+        old_path: String,
+        new_path: String,
+    },
     WordWrapChanged(bool),
     ShowAllFilesChanged(bool),
     CloseReady,
     CloseCancelled,
+    /// A footer row: open this subagent's transcript in the right pane.
+    OpenSubagent {
+        doc_id: String,
+        title: String,
+        frozen: bool,
+    },
+    /// A footer row: open this side chat (by id) in the right pane.
+    OpenChildChat(String),
+    /// The Chats header's "+": start a fresh side chat of the active chat.
+    NewChildChat,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,6 +222,8 @@ pub struct FilesSurface {
     loads: HashMap<(String, Option<String>), Task<()>>,
     error: Option<SharedString>,
     started: bool,
+    /// The Subagents / Chats footer under the tree.
+    sections: sections::ExplorerSections,
     _observe: Subscription,
     _search_events: Subscription,
 }
@@ -233,6 +249,9 @@ impl Render for FilesSurface {
             self.render_explorer(&theme, cx).into_any_element()
         };
         let editor_context_menu = self.render_editor_context_menu(&theme, cx);
+        // The explorer docks its Subagents / Chats sections under the tree;
+        // an editor surface has no footer.
+        let sections = (!is_editor).then(|| self.render_sections(&theme, cx));
         div()
             .id(SharedString::from(format!(
                 "files-surface-{}",
@@ -247,6 +266,7 @@ impl Render for FilesSurface {
             .flex_col()
             .children(header)
             .child(div().flex_1().min_h_0().w_full().child(body))
+            .children(sections)
             .children(editor_context_menu)
     }
 }
@@ -485,6 +505,9 @@ impl FilesSurface {
                 this.ensure_loaded(cx);
             }
             this.sync_active_markdown_comments(cx);
+            if !this.presentation.is_editor() {
+                this.refresh_sections(cx);
+            }
         });
         // The list state exposes no scroll handle, so the floating rail
         // bridges scroll activity through the scroll handler (the
@@ -532,6 +555,7 @@ impl FilesSurface {
             loads: HashMap::new(),
             error: None,
             started: false,
+            sections: sections::ExplorerSections::default(),
             _observe: observe,
             _search_events: search_events,
         };
@@ -1029,13 +1053,10 @@ impl FilesSurface {
                     .cursor_text()
                     .hover(|style| style.bg(crate::theme::ink(0.055)))
                     // Clicking the field's padding focuses the input too.
-                    .on_mouse_down(
-                        gpui::MouseButton::Left,
-                        move |_, window, cx| {
-                            window.focus(&search_focus, cx);
-                            cx.stop_propagation();
-                        },
-                    )
+                    .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| {
+                        window.focus(&search_focus, cx);
+                        cx.stop_propagation();
+                    })
                     .child(
                         crate::icons::icon(crate::icons::MAGNIFER)
                             .size(px(12.0))
@@ -1116,10 +1137,7 @@ mod explorer_tests {
         cx.update(|window, cx| window.draw(cx).clear());
         // The explorer header is the same band as the editor header.
         let header = cx.debug_bounds("files-explorer-header").unwrap();
-        assert_eq!(
-            header.size.height,
-            px(crate::surface_chrome::HEADER_HEIGHT)
-        );
+        assert_eq!(header.size.height, px(crate::surface_chrome::HEADER_HEIGHT));
         let bounds = cx.debug_bounds("files-search").unwrap();
         assert!(bounds.top() >= header.top() && bounds.bottom() <= header.bottom());
         // Click the field padding, not just the input's text hitbox.

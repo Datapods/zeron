@@ -908,6 +908,7 @@ impl Tools {
                     .or_else(|| space.map(|s| s.path.clone()))
                     .unwrap_or_else(|| "~".into());
                 let request = RunRequest {
+                    mcp: None,
                     prompt: text,
                     harness: Some(harness),
                     model: config.as_ref().and_then(|c| c.model.clone()),

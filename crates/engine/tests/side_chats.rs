@@ -135,17 +135,29 @@ async fn fork_is_frozen_durable_idempotent_and_has_an_independent_provider_sessi
     assert_eq!(fork.cwd, Some("/tmp".into()));
     assert!(fork.on_chat2());
     let target = core.doc_host.open("side").unwrap();
+    let copied = target.doc().read_entries().unwrap();
+    // The frozen prefix, then the seam: a system entry naming the source.
+    assert_eq!(copied[..2], source.doc().read_entries().unwrap()[..2]);
+    assert_eq!(copied.len(), 3);
+    assert_eq!(copied[2].role, MessageRole::System);
+    assert_eq!(copied[2].status, Some(MessageStatus::Complete));
     assert_eq!(
-        target.doc().read_entries().unwrap(),
-        source.doc().read_entries().unwrap()[..2]
+        copied[2].parts,
+        vec![zeron_doc::MessagePart::Fork {
+            id: "fork:side".into(),
+            source_chat_id: "main".into(),
+            source_title: "Main conversation".into(),
+        }]
     );
     client.call(methods::FORK_SIDE_CHAT, params).await.unwrap();
-    assert_eq!(target.doc().read_entries().unwrap().len(), 2);
+    assert_eq!(target.doc().read_entries().unwrap().len(), 3);
+    core.sessions.set_ipc_port(27699);
     core.sessions
         .dispatch(
             "side",
             HarnessId::Mock,
             RunRequest {
+                mcp: None,
                 prompt: "What did I ask you to remember?".into(),
                 harness: Some(HarnessId::Mock),
                 model: None,
@@ -171,18 +183,32 @@ async fn fork_is_frozen_durable_idempotent_and_has_an_independent_provider_sessi
     .unwrap();
     let request = requests.lock().unwrap()[0].clone();
     assert_eq!(request.resume, None);
+    // The host stamps its MCP server onto the run: this binary's `zeron
+    // mcp`, dialing the served port, identified as the side chat.
+    let mcp = request
+        .mcp
+        .clone()
+        .expect("run carries the zeron MCP server");
+    assert_eq!(mcp.name, "zeron");
+    assert_eq!(mcp.args, ["mcp"]);
+    assert_eq!(mcp.env["ZERON_IPC_PORT"], "27699");
+    assert_eq!(mcp.env["ZERON_CHAT_ID"], "side");
+    assert_eq!(mcp.env["ZERON_DEVICE_ID"], core.device_id);
     assert!(request.prompt.contains("PINEAPPLE"));
     assert!(!request.prompt.contains("unfinished turn"));
     assert_eq!(source.doc().read_entries().unwrap().len(), 4);
+    // The fork's first own turn lands after the seam, and the seam itself
+    // never reaches the provider as conversation text.
     assert_eq!(
-        target.doc().read_entries().unwrap()[2].parts[0],
+        target.doc().read_entries().unwrap()[3].parts[0],
         MessagePart::Text {
-            id: target.doc().read_entries().unwrap()[2].parts[0]
+            id: target.doc().read_entries().unwrap()[3].parts[0]
                 .id()
                 .to_string(),
             text: "What did I ask you to remember?".into()
         }
     );
+    assert!(!request.prompt.contains("fork:side"));
     core.shutdown().await;
     drop(client);
     drop(source);
@@ -250,4 +276,112 @@ async fn cannot_fork_an_empty_chat_or_overwrite_a_main_chat() {
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn forking_a_side_chat_can_land_as_a_sibling_under_the_main_chat() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = EngineCore::assemble(
+        dir.path(),
+        Arc::new(HarnessRegistry::new()),
+        HarnessId::Mock,
+        None,
+    )
+    .unwrap();
+    core.workspace
+        .create_chat("main", None, Some(&core.device_id), None, None)
+        .unwrap();
+    let main = core.doc_host.open("main").unwrap();
+    main.doc()
+        .push_message(&message(
+            "u1",
+            MessageRole::User,
+            "hi",
+            MessageStatus::Complete,
+        ))
+        .unwrap();
+    main.doc()
+        .push_message(&message(
+            "a1",
+            MessageRole::Assistant,
+            "hello",
+            MessageStatus::Complete,
+        ))
+        .unwrap();
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    // A first-level side chat, then its own fork button: the copy hangs
+    // under MAIN (the side chat's parent), not under the side chat.
+    let side = client
+        .call_as::<zeron_proto::Chat>(
+            methods::FORK_SIDE_CHAT,
+            serde_json::json!({ "chatId": "side", "sourceChatId": "main" }),
+        )
+        .await
+        .unwrap();
+    core.workspace.rename_chat("side", "Side quest").unwrap();
+    assert_eq!(side.parent_chat_id.as_deref(), Some("main"));
+    // A turn of its own after the seam, so the seam sits inside the frozen
+    // prefix the next fork copies.
+    let side_doc = core.doc_host.open("side").unwrap();
+    side_doc
+        .doc()
+        .push_message(&message(
+            "u2",
+            MessageRole::User,
+            "more",
+            MessageStatus::Complete,
+        ))
+        .unwrap();
+    side_doc
+        .doc()
+        .push_message(&message(
+            "a2",
+            MessageRole::Assistant,
+            "sure",
+            MessageStatus::Complete,
+        ))
+        .unwrap();
+    let sibling = client
+        .call_as::<zeron_proto::Chat>(
+            methods::FORK_SIDE_CHAT,
+            serde_json::json!({
+                "chatId": "side-2",
+                "sourceChatId": "side",
+                "parentChatId": "main",
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sibling.parent_chat_id.as_deref(), Some("main"));
+    let entries = core
+        .doc_host
+        .open("side-2")
+        .unwrap()
+        .doc()
+        .read_entries()
+        .unwrap();
+    // Lineage survives: the side chat's own seam is copied, then a new one
+    // names the side chat (by its title at fork time) as this copy's source.
+    let seams: Vec<_> = entries
+        .iter()
+        .filter_map(|e| match e.parts.first() {
+            Some(zeron_doc::MessagePart::Fork { source_title, .. }) => Some(source_title.clone()),
+            _ => None,
+        })
+        .collect();
+    // The untitled main chat falls back to the placeholder title.
+    assert_eq!(seams, ["New session", "Side quest"]);
+    // An empty parent falls back to the source, like an omitted one.
+    let nested = client
+        .call_as::<zeron_proto::Chat>(
+            methods::FORK_SIDE_CHAT,
+            serde_json::json!({
+                "chatId": "side-3",
+                "sourceChatId": "side",
+                "parentChatId": "",
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(nested.parent_chat_id.as_deref(), Some("side"));
 }
