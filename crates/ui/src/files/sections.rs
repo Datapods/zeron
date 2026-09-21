@@ -399,19 +399,14 @@ impl FilesSurface {
             .cursor_pointer()
             .hover(|s| s.bg(crate::theme::wash(0.04)))
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.sections.toggle(
-                    section,
-                    if this.sections.is_open(section) {
-                        0.0
-                    } else {
-                        full_height
-                    },
-                    if this.sections.is_open(section) {
-                        full_height
-                    } else {
-                        0.0
-                    },
-                );
+                // Open → close runs from the full body height to 0, and back.
+                let was_open = this.sections.is_open(section);
+                let (resting, target) = if was_open {
+                    (full_height, 0.0)
+                } else {
+                    (0.0, full_height)
+                };
+                this.sections.toggle(section, resting, target);
                 cx.notify();
             }))
             .child(

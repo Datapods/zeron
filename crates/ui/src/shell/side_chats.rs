@@ -179,6 +179,10 @@ impl Shell {
             self.set_right_active(RightSurface::SideChat(id), cx);
             return;
         }
+        // A footer row or header button may land while the surface host is
+        // closed (explorer-only pane): open it beside the explorer first.
+        // Programmatic, so an already-open pane is left alone.
+        self.set_surfaces_open(true, cx);
         let parent = self.state.clone();
         let state = cx.new(|cx| AppState::side_chat_state(&parent, chat, cx));
         let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));

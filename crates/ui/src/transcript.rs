@@ -7059,14 +7059,9 @@ fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
 /// <source>", the source title in the body color so the eye lands on where
 /// the history came from. Quiet on purpose — it is orientation, not content.
 fn fork_marker(source_title: SharedString, theme: &Theme) -> AnyElement {
-    let rule = || {
-        div()
-            .flex_1()
-            .h_0()
-            .border_t_1()
-            .border_dashed()
-            .border_color(theme.border)
-    };
+    // A painted 1px hairline rather than a border: a bordered box this
+    // thin does not draw on the Linux backend (verified on the rig).
+    let rule = || div().flex_1().h(px(1.0)).bg(theme.border_strong);
     div()
         .py(px(14.0))
         .w_full()
