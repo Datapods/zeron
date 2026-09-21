@@ -1640,6 +1640,7 @@ pub fn rows_for_entry(
                             entry_id: entry_id.clone(),
                             timestamp: None,
                             copy_text: None,
+                            compact_fold: None,
                         });
                     }
                     // Tools and thoughts are grouped by the outer arms;

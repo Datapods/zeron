@@ -12,7 +12,7 @@
 //! The footer is a pane of its own: its height is dragged at the seam with
 //! the tree and persisted (`UiSettings::files_sections_height`), open
 //! sections share that height and scroll, and like the sidebar's Archived
-//! shelf each shows ten rows before a "Show more" row pages by 25.
+//! shelf each shows ten rows before a "Show N more" row pages by ten.
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -50,7 +50,7 @@ const HEADER_GROUP: &str = "files-section-header";
 /// Rows a section shows before "Show more" pages it, and the page size —
 /// the sidebar's Archived shelf numbers.
 const INITIAL_ROWS: usize = 10;
-const PAGE_ROWS: usize = 25;
+const PAGE_ROWS: usize = 10;
 /// An open section never shrinks below this, so one or two rows still
 /// leave the section room to breathe.
 const MIN_BODY_HEIGHT: f32 = 120.0;
@@ -754,7 +754,7 @@ impl FilesSurface {
             .text_size(crate::typography::ui_rems(12.0))
             .text_color(theme.text_muted.opacity(0.7))
             .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text_muted))
-            .child(format!("Show more ({remaining})"))
+            .child(format!("Show {} more", remaining.min(PAGE_ROWS)))
             .on_click(cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
                 let shown = this.sections.shown(section) + PAGE_ROWS;
@@ -1131,6 +1131,7 @@ mod tests {
 
     fn entry(parts: Vec<MessagePart>) -> SessionMessageEntry {
         SessionMessageEntry {
+            duration_ms: None,
             id: "e1".into(),
             role: MessageRole::Assistant,
             parts,
@@ -1228,11 +1229,11 @@ mod tests {
         // Eleven rows: ten visible plus the "Show more" slot.
         let eleven = content_height(Section::Chats, 11, INITIAL_ROWS);
         assert_eq!(eleven - ten, ROW_HEIGHT + ROW_GAP);
-        // Paging once reveals up to 35 rows before the next "Show more".
+        // Paging once reveals up to 20 rows before the next "Show more".
         let paged = content_height(Section::Chats, 40, INITIAL_ROWS + PAGE_ROWS);
         assert_eq!(
             paged,
-            SECTION_BODY_INSET + 36.0 * ROW_HEIGHT + 35.0 * ROW_GAP
+            SECTION_BODY_INSET + 21.0 * ROW_HEIGHT + 20.0 * ROW_GAP
         );
         // Empty sections want their icon + copy; Chats adds the action row.
         assert_eq!(

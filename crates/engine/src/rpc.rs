@@ -1636,6 +1636,7 @@ impl RpcService for EngineRpc {
                     target
                         .doc()
                         .push_message(&zeron_doc::SessionMessageEntry {
+                            duration_ms: None,
                             id: marker_id.clone(),
                             role: zeron_doc::MessageRole::System,
                             parts: vec![zeron_doc::MessagePart::Fork {

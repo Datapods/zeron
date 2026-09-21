@@ -1393,6 +1393,7 @@ mod tests {
             source_title: "Main conversation".into(),
         };
         doc.push_message(&SessionMessageEntry {
+            duration_ms: None,
             id: "fork:side".into(),
             role: MessageRole::System,
             parts: vec![seam.clone()],
