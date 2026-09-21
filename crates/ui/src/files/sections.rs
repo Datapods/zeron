@@ -51,6 +51,9 @@ const HEADER_GROUP: &str = "files-section-header";
 /// the sidebar's Archived shelf numbers.
 const INITIAL_ROWS: usize = 10;
 const PAGE_ROWS: usize = 25;
+/// An open section never shrinks below this, so one or two rows still
+/// leave the section room to breathe.
+const MIN_BODY_HEIGHT: f32 = 120.0;
 const FOOTER_PAD_TOP: f32 = 4.0;
 const FOOTER_PAD_BOTTOM: f32 = 6.0;
 /// Drag hitbox straddling the seam with the tree.
@@ -343,6 +346,10 @@ pub(super) fn fingerprint(state: &AppState, chat_id: &str, now: DateTime<Utc>) -
 /// inset, the visible rows, and a "Show more" row while more remain. Empty
 /// sections want their empty-state copy (Chats adds its action row).
 pub(super) fn content_height(section: Section, count: usize, shown: usize) -> f32 {
+    content_height_unfloored(section, count, shown).max(MIN_BODY_HEIGHT)
+}
+
+fn content_height_unfloored(section: Section, count: usize, shown: usize) -> f32 {
     if count == 0 {
         return SECTION_BODY_INSET
             + EMPTY_PAD * 2.0
@@ -1214,8 +1221,9 @@ mod tests {
 
     #[test]
     fn content_height_pages_at_ten_rows_and_counts_the_show_more_row() {
+        // Short lists are floored so a section keeps its presence.
         let one = content_height(Section::Chats, 1, INITIAL_ROWS);
-        assert_eq!(one, SECTION_BODY_INSET + ROW_HEIGHT);
+        assert_eq!(one, MIN_BODY_HEIGHT);
         let ten = content_height(Section::Chats, 10, INITIAL_ROWS);
         // Eleven rows: ten visible plus the "Show more" slot.
         let eleven = content_height(Section::Chats, 11, INITIAL_ROWS);
@@ -1228,11 +1236,11 @@ mod tests {
         );
         // Empty sections want their icon + copy; Chats adds the action row.
         assert_eq!(
-            content_height(Section::Chats, 0, INITIAL_ROWS)
-                - content_height(Section::Subagents, 0, INITIAL_ROWS),
+            content_height_unfloored(Section::Chats, 0, INITIAL_ROWS)
+                - content_height_unfloored(Section::Subagents, 0, INITIAL_ROWS),
             EMPTY_ACTIONS_HEIGHT
         );
-        assert!(content_height(Section::Subagents, 0, INITIAL_ROWS) >= 50.0);
+        assert!(content_height(Section::Subagents, 0, INITIAL_ROWS) >= MIN_BODY_HEIGHT);
     }
 
     #[test]

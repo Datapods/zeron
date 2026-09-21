@@ -38,8 +38,8 @@ pub const FILES_PANEL_MIN: f32 = 220.0;
 pub const FILES_PANEL_MAX: f32 = 440.0;
 /// The explorer footer (Subagents / Chats) height budget, dragged at its
 /// seam with the tree.
-pub const FILES_SECTIONS_DEFAULT: f32 = 340.0;
-pub const FILES_SECTIONS_MIN: f32 = 260.0;
+pub const FILES_SECTIONS_DEFAULT: f32 = 510.0;
+pub const FILES_SECTIONS_MIN: f32 = 390.0;
 pub const FILES_SECTIONS_MAX: f32 = 720.0;
 
 pub fn clamp_files_sections_height(height: f32) -> f32 {
@@ -2078,7 +2078,7 @@ mod tests {
             notifications_enabled: false,
             notifications_background_only: false,
             files_panel_width: 310.0,
-            files_sections_height: 280.0,
+            files_sections_height: 420.0,
             right_pane_width: 700.0,
             right_pane_open: true,
             terminal_height: 320.0,
