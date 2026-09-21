@@ -1513,7 +1513,6 @@ pub struct Shell {
     right_plus: popover::Popup<()>,
     /// Host-owned project Actions cached per (device, space).
     project_actions: crate::project_actions::ProjectActionsController,
-    side_chat_history_popup: popover::Popup<()>,
     /// Diff surfaces by id — each tab its own [`Changes`] viewer with its own
     /// scope/base pick and diff watch (multiple diff panels, user request).
     diffs: std::collections::HashMap<u64, Entity<Changes>>,
@@ -1933,7 +1932,6 @@ impl Shell {
             right_terminal: None,
             right_plus: popover::Popup::default(),
             project_actions: crate::project_actions::ProjectActionsController::default(),
-            side_chat_history_popup: popover::Popup::default(),
             diffs: std::collections::HashMap::new(),
             files: std::collections::HashMap::new(),
             files_subs: std::collections::HashMap::new(),
@@ -7865,13 +7863,6 @@ impl Shell {
             return true;
         }
 
-        if self.side_chat_history_popup.is_open() {
-            self.close_side_chat_history(cx);
-            return true;
-        }
-        if self.side_chat_history_popup.get().is_some() {
-            return true;
-        }
         if self.right_plus.is_open() {
             self.close_right_plus(cx);
             return true;
@@ -9200,7 +9191,6 @@ impl Shell {
     /// (icon + label). The old two-card grid clipped in narrow panes and
     /// wasted short ones.
     fn render_surface_picker(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let history = self.side_chat_history(cx);
         let theme = Theme::of(cx).clone();
         let text = theme.text;
         let muted = theme.text_muted;
@@ -9274,7 +9264,6 @@ impl Shell {
                         )
                     }),
             )
-            .child(history)
             .into_any_element()
     }
 
