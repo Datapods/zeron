@@ -43,6 +43,78 @@ final class SessionStoreDurabilityTests: XCTestCase {
         XCTAssertEqual(callbacks, 1)
     }
 
+    func testCommitAsyncWritesAndNotifies() async {
+        var callbacks = 0
+        var written: Data?
+        let saver = DocSaver { true }
+        saver.onSaved = { callbacks += 1 }
+        saver.poke()
+
+        let result = await saver.commitAsync(
+            export: { Data([1, 2, 3]) },
+            write: { data in
+                written = data
+                return true
+            }
+        )
+
+        XCTAssertTrue(result)
+        XCTAssertEqual(written, Data([1, 2, 3]))
+        XCTAssertFalse(saver.isDirty)
+        XCTAssertEqual(callbacks, 1)
+    }
+
+    func testCommitAsyncDropsStaleExport() async {
+        var writes = 0
+        let saver = DocSaver { true }
+        saver.poke()
+
+        let result = await saver.commitAsync(
+            export: {
+                DispatchQueue.main.sync {
+                    MainActor.assumeIsolated {
+                        saver.poke()
+                    }
+                }
+                return Data([4, 5, 6])
+            },
+            write: { _ in
+                writes += 1
+                return true
+            }
+        )
+
+        XCTAssertFalse(result)
+        XCTAssertEqual(writes, 0)
+        XCTAssertTrue(saver.isDirty)
+    }
+
+    func testRealStoreAsyncFlushPersistsOutbox() async throws {
+        let id = "async-flush-\(UUID().uuidString)"
+        let url = DocDisk.chat2URL(for: id)
+        defer {
+            try? FileManager.default.removeItem(at: url)
+        }
+        let store = SessionStore(chatId: id, config: config())
+        defer { store.stop() }
+        store.start(holdDial: true)
+        let baseline = store.outbox.count
+
+        try store.doc.getMap(id: "test").insert(key: "value", v: "async")
+        store.doc.commit()
+
+        for _ in 0..<20 {
+            await Task.yield()
+            if store.outbox.count > baseline { break }
+        }
+        XCTAssertEqual(store.outbox.count, baseline + 1)
+
+        await store.flushToDiskAsync()
+
+        let loaded = try XCTUnwrap(DocDisk.loadChat2(into: LoroDoc(), id: id))
+        XCTAssertEqual(loaded.outbox.map(\.batchId), store.outbox.map(\.batchId))
+    }
+
     func testLocalCommitIsOnDiskBeforeAdmission() async throws {
         let id = "durable-store-\(UUID().uuidString)"
         defer { try? FileManager.default.removeItem(at: DocDisk.chat2URL(for: id)) }

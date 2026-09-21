@@ -9,6 +9,42 @@ import SwiftUI
 import UIKit
 import os
 
+private final class BackgroundFlushState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var identifier: UIBackgroundTaskIdentifier = .invalid
+    private var cancelled = false
+
+    func setIdentifier(_ identifier: UIBackgroundTaskIdentifier) {
+        lock.lock()
+        self.identifier = identifier
+        lock.unlock()
+    }
+
+    func cancel() -> UIBackgroundTaskIdentifier {
+        lock.lock()
+        cancelled = true
+        let identifier = self.identifier
+        self.identifier = .invalid
+        lock.unlock()
+        return identifier
+    }
+
+    func finish() -> UIBackgroundTaskIdentifier {
+        lock.lock()
+        let identifier = self.identifier
+        self.identifier = .invalid
+        lock.unlock()
+        return identifier
+    }
+
+    var isCancelled: Bool {
+        lock.lock()
+        let cancelled = self.cancelled
+        lock.unlock()
+        return cancelled
+    }
+}
+
 @MainActor
 @Observable
 final class AppModel {
@@ -623,7 +659,29 @@ final class AppModel {
     /// Persist every open doc now (app backgrounding).
     func flushDocs() {
         workspace?.flushToDisk()
-        sessionStores.values.forEach { $0.flushToDisk() }
+        let orderedIDs = Array(Self.evictionOrder(lastUsed: storeLastUsed) { _ in false }.reversed())
+        let knownIDs = Set(orderedIDs)
+        let missingIDs = sessionStores.keys.filter { !knownIDs.contains($0) }
+        let stores = (orderedIDs + missingIDs).compactMap { sessionStores[$0] }
+        guard !stores.isEmpty else { return }
+
+        let state = BackgroundFlushState()
+        let identifier = UIApplication.shared.beginBackgroundTask(withName: "zeron.flushDocs") {
+            let identifier = state.cancel()
+            if identifier != .invalid {
+                UIApplication.shared.endBackgroundTask(identifier)
+            }
+        }
+        state.setIdentifier(identifier)
+        Task { @MainActor [stores, state] in
+            for store in stores where !state.isCancelled && !store.stopped {
+                await store.flushToDiskAsync()
+            }
+            let identifier = state.finish()
+            if identifier != .invalid {
+                UIApplication.shared.endBackgroundTask(identifier)
+            }
+        }
     }
 
     /// Foreground hook: kick every room NOW (see ChatRoomClient.kick) — after

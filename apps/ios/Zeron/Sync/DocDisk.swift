@@ -135,6 +135,14 @@ enum DocDisk {
                           firstContactQueued: Bool = false,
                           outbox: [(batchId: String, bytes: Data)] = []) -> Bool {
         guard let snapshot = try? doc.export(mode: .snapshot) else { return false }
+        return saveChat2(snapshot: snapshot, id: id, cursor: cursor, verified: verified,
+                         firstContactQueued: firstContactQueued, outbox: outbox)
+    }
+
+    @discardableResult
+    static func saveChat2(snapshot: Data, id: String, cursor: UInt64, verified: Bool,
+                          firstContactQueued: Bool = false,
+                          outbox: [(batchId: String, bytes: Data)] = []) -> Bool {
         var data = chat2OutboxMagic
         var le = cursor.littleEndian
         withUnsafeBytes(of: &le) { data.append(contentsOf: $0) }
@@ -321,6 +329,26 @@ final class DocSaver {
             return false
         }
         dirty = false
+        generation += 1
+        onSaved?()
+        return true
+    }
+
+    /// Off-main commit: export runs detached, then the write returns to the
+    /// main actor and is dropped if a newer commit landed meanwhile.
+    func commitAsync(export: @escaping @Sendable () -> Data?,
+                     write: @escaping (Data) -> Bool) async -> Bool {
+        guard dirty else { return true }
+        let expected = generation
+        let snapshot = await Task.detached(priority: .utility) { export() }.value
+        guard generation == expected else { return false }
+        guard let snapshot, write(snapshot) else {
+            dirty = true
+            scheduleRetry()
+            return false
+        }
+        dirty = false
+        generation += 1
         onSaved?()
         return true
     }

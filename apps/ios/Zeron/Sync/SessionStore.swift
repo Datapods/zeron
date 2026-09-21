@@ -414,6 +414,25 @@ final class SessionStore {
         saver?.flush()
     }
 
+    func flushToDiskAsync() async {
+        guard !stopped, let saver else { return }
+        let cursor = self.cursor
+        let verified = self.cursorVerified
+        let firstContactQueued = self.firstContactQueued
+        let outbox = self.outbox
+        let chatId = self.chatId
+        let doc = self.doc
+        _ = await saver.commitAsync(
+            export: { [doc] in try? doc.export(mode: .snapshot) },
+            write: { snapshot in
+                DocDisk.saveChat2(snapshot: snapshot, id: chatId, cursor: cursor,
+                                  verified: verified,
+                                  firstContactQueued: firstContactQueued,
+                                  outbox: outbox)
+            }
+        )
+    }
+
     /// Foreground hook: revive the room after a suspension (see
     /// ChatRoomClient.kick). Also the catch-all re-check for a roomGen flip
     /// that landed while this store had no open view.
