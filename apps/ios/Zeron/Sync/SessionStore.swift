@@ -74,6 +74,10 @@ final class SessionStore {
     @ObservationIgnored private var firstContactQueued = false
     @ObservationIgnored private(set) var outbox: [(batchId: String, bytes: Data)] = []
     @ObservationIgnored private var admitted: Set<String> = []
+    private(set) var snapshotBytes = 0
+    private(set) var viewAttached = false
+    var keepsParseCacheWarm = false
+    var onPersisted: (() -> Void)?
     private var chatRoom: ChatRoomClient?
     private var subscriptions: [Subscription] = []
     private let config: AppConfig
@@ -147,7 +151,9 @@ final class SessionStore {
     func setEntries(_ new: [MessageEntry]) {
         entries = new
         revision &+= 1
-        transcriptCache.prewarm(entries: entries)
+        if viewAttached || keepsParseCacheWarm {
+            transcriptCache.prewarm(entries: entries)
+        }
     }
 
     @ObservationIgnored private var saver: DocSaver?
@@ -164,6 +170,7 @@ final class SessionStore {
             cursorVerified = saved.verified
             firstContactQueued = saved.firstContactQueued
             outbox = saved.outbox
+            snapshotBytes = saved.bytes
             project()
         } else if DocDisk.legacySnapshotExists(id: chatId) {
             // M3 discard-and-adopt: this device's cached doc predates the
@@ -173,13 +180,23 @@ final class SessionStore {
         }
         saver = DocSaver { [weak self] in
             guard let self else { return false }
-            return DocDisk.saveChat2(doc: self.doc, id: self.chatId, cursor: self.cursor,
-                                     verified: self.cursorVerified,
-                                     firstContactQueued: self.firstContactQueued,
-                                     outbox: self.outbox)
+            guard DocDisk.saveChat2(doc: self.doc, id: self.chatId,
+                                    cursor: self.cursor,
+                                    verified: self.cursorVerified,
+                                    firstContactQueued: self.firstContactQueued,
+                                    outbox: self.outbox) else {
+                return false
+            }
+            self.snapshotBytes = DocDisk.chat2SnapshotSize(id: self.chatId)
+            return true
+        }
+        saver?.background = { [weak self] in
+            guard let self else { return false }
+            return await self.flushToDiskAsync()
         }
         saver?.onSaved = { [weak self] in
             self?.admitDurableBatches()
+            self?.onPersisted?()
         }
         // Subscription BEFORE any connect: every local commit lands in the
         // client when it exists; commits made earlier are covered by the
@@ -409,6 +426,15 @@ final class SessionStore {
         roomLog.info("chat2 \(self.chatId, privacy: .public): adopt carried \(carried) pending command(s) from the s2 lineage")
     }
 
+    func attachView() {
+        viewAttached = true
+        transcriptCache.prewarm(entries: entries)
+    }
+
+    func detachView() {
+        viewAttached = false
+    }
+
     /// Backgrounding hook: persist immediately.
     func flushToDisk() {
         saver?.flush()
@@ -418,21 +444,29 @@ final class SessionStore {
         saver?.retireTimers()
     }
 
-    func flushToDiskAsync() async {
-        guard !stopped, let saver else { return }
+    func flushToDiskAsync() async -> Bool {
+        guard !stopped, let saver else { return false }
         let cursor = self.cursor
         let verified = self.cursorVerified
         let firstContactQueued = self.firstContactQueued
         let outbox = self.outbox
         let chatId = self.chatId
         let doc = self.doc
-        _ = await saver.commitAsync(
+        return await saver.commitAsync(
             export: { [doc] in try? doc.export(mode: .snapshot) },
-            write: { snapshot in
-                DocDisk.saveChat2(snapshot: snapshot, id: chatId, cursor: cursor,
-                                  verified: verified,
-                                  firstContactQueued: firstContactQueued,
-                                  outbox: outbox)
+            write: { [weak self] snapshot in
+                guard let written = DocDisk.saveChat2ReturningBytes(
+                    snapshot: snapshot,
+                    id: chatId,
+                    cursor: cursor,
+                    verified: verified,
+                    firstContactQueued: firstContactQueued,
+                    outbox: outbox
+                ) else {
+                    return false
+                }
+                self?.snapshotBytes = written
+                return true
             }
         )
     }
@@ -461,7 +495,33 @@ final class SessionStore {
         holdDial = false
         lifecycleGeneration &+= 1
         subscriptions.removeAll()
-        saver?.flush()
+        if let saver, saver.isDirty {
+            let doc = self.doc
+            let cursor = self.cursor
+            let verified = self.cursorVerified
+            let firstContactQueued = self.firstContactQueued
+            let outbox = self.outbox
+            let chatId = self.chatId
+            Task { @MainActor [weak self, saver, doc] in
+                _ = await saver.commitAsync(
+                    export: { try? doc.export(mode: .snapshot) },
+                    write: { [weak self] snapshot in
+                        guard let written = DocDisk.saveChat2ReturningBytes(
+                            snapshot: snapshot,
+                            id: chatId,
+                            cursor: cursor,
+                            verified: verified,
+                            firstContactQueued: firstContactQueued,
+                            outbox: outbox
+                        ) else {
+                            return false
+                        }
+                        self?.snapshotBytes = written
+                        return true
+                    }
+                )
+            }
+        }
         saver?.onSaved = nil
         saver = nil
         if let chatRoom {
@@ -489,6 +549,23 @@ final class SessionStore {
     /// In-flight guard + trailing re-run for the off-main projection below.
     @ObservationIgnored private var projecting = false
     @ObservationIgnored private var projectPending = false
+    @ObservationIgnored private var projectionTrailingScheduled = false
+    @ObservationIgnored private var lastProjectionAt: DispatchTime?
+
+    private func scheduleTrailingProjection(after delay: UInt64) {
+        guard !projectionTrailingScheduled else { return }
+        projectionTrailingScheduled = true
+        let generation = lifecycleGeneration
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: delay)
+            guard let self, !self.stopped,
+                  self.lifecycleGeneration == generation else { return }
+            self.projectionTrailingScheduled = false
+            guard self.projectPending else { return }
+            self.projectPending = false
+            self.project()
+        }
+    }
 
     /// Re-derive `entries` from the doc, off the main thread.
     ///
@@ -507,6 +584,15 @@ final class SessionStore {
             projectPending = true
             return
         }
+        if !viewAttached, let lastProjectionAt {
+            let elapsed = DispatchTime.now().uptimeNanoseconds &-
+                lastProjectionAt.uptimeNanoseconds
+            if elapsed < 1_000_000_000 {
+                projectPending = true
+                scheduleTrailingProjection(after: 1_000_000_000 - elapsed)
+                return
+            }
+        }
         projecting = true
         let doc = self.doc
         let generation = lifecycleGeneration
@@ -517,12 +603,17 @@ final class SessionStore {
             guard let self, !self.stopped,
                   self.lifecycleGeneration == generation else { return }
             self.projecting = false
+            self.lastProjectionAt = .now()
             if let decoded {
                 self.apply(decoded.entries, queue: decoded.queue)
             }
             if self.projectPending {
                 self.projectPending = false
-                self.project()
+                if self.viewAttached {
+                    self.project()
+                } else {
+                    self.scheduleTrailingProjection(after: 1_000_000_000)
+                }
             }
         }
     }
@@ -536,7 +627,9 @@ final class SessionStore {
         revision &+= 1
         // If no transcript view is open, settle the parses now (off-main) so
         // the eventual open is memo hits all the way down.
-        transcriptCache.prewarm(entries: entries)
+        if viewAttached || keepsParseCacheWarm {
+            transcriptCache.prewarm(entries: entries)
+        }
     }
 
     /// Whole-doc decode. `nil` means the doc has no map root yet — leave the

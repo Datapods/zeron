@@ -13,10 +13,10 @@ final class SessionStoreDurabilityTests: XCTestCase {
     func testCommitNowSavesImmediatelyAndNotifies() {
         var saves = 0
         var callbacks = 0
-        let saver = DocSaver {
+        let saver = DocSaver(save: {
             saves += 1
             return true
-        }
+        }, quietDebounceNs: 1_500_000_000, maxDeferralNs: 10_000_000_000)
         saver.onSaved = { callbacks += 1 }
         saver.poke()
 
@@ -94,10 +94,10 @@ final class SessionStoreDurabilityTests: XCTestCase {
         let gate = DispatchSemaphore(value: 0)
         var saves = 0
         var wrote = false
-        let saver = DocSaver {
+        let saver = DocSaver(save: {
             saves += 1
             return true
-        }
+        }, quietDebounceNs: 1_500_000_000, maxDeferralNs: 10_000_000_000)
         saver.poke()
 
         let task = Task { @MainActor in
@@ -128,10 +128,10 @@ final class SessionStoreDurabilityTests: XCTestCase {
 
     func testRetireTimersLeavesDirtyAndCancelsDebounce() async {
         var saves = 0
-        let saver = DocSaver {
+        let saver = DocSaver(save: {
             saves += 1
             return true
-        }
+        }, quietDebounceNs: 1_500_000_000, maxDeferralNs: 10_000_000_000)
         saver.poke()
         saver.retireTimers()
 
@@ -146,10 +146,10 @@ final class SessionStoreDurabilityTests: XCTestCase {
         var saves = 0
         var shouldSucceed = false
         var wrote = false
-        let saver = DocSaver {
+        let saver = DocSaver(save: {
             saves += 1
             return shouldSucceed
-        }
+        }, quietDebounceNs: 1_500_000_000, maxDeferralNs: 10_000_000_000)
         saver.poke()
         XCTAssertFalse(saver.commitNow())
         XCTAssertEqual(saves, 1)
@@ -188,14 +188,14 @@ final class SessionStoreDurabilityTests: XCTestCase {
         var bSaves = 0
         var aWrote = false
         var bWrote = false
-        let a = DocSaver {
+        let a = DocSaver(save: {
             aSaves += 1
             return true
-        }
-        let b = DocSaver {
+        }, quietDebounceNs: 1_500_000_000, maxDeferralNs: 10_000_000_000)
+        let b = DocSaver(save: {
             bSaves += 1
             return true
-        }
+        }, quietDebounceNs: 1_500_000_000, maxDeferralNs: 10_000_000_000)
         a.poke()
         b.poke()
         a.retireTimers()
@@ -239,7 +239,9 @@ final class SessionStoreDurabilityTests: XCTestCase {
         let started = expectation(description: "detached export started")
         let gate = DispatchSemaphore(value: 0)
         var wrote = false
-        let saver = DocSaver { true }
+        let saver = DocSaver(save: { true },
+                             quietDebounceNs: 1_500_000_000,
+                             maxDeferralNs: 10_000_000_000)
         saver.poke()
 
         let task = Task { @MainActor in
@@ -264,6 +266,86 @@ final class SessionStoreDurabilityTests: XCTestCase {
         XCTAssertFalse(result)
         XCTAssertFalse(wrote)
         XCTAssertTrue(saver.isDirty)
+    }
+
+    func testQuietDebounceCoalescesContinuousPokes() async {
+        var saves = 0
+        let saver = DocSaver(save: {
+            saves += 1
+            return true
+        }, quietDebounceNs: 300_000_000, maxDeferralNs: 10_000_000_000)
+
+        for _ in 0..<40 {
+            saver.poke()
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        try? await Task.sleep(nanoseconds: 500_000_000)
+
+        XCTAssertEqual(saves, 1)
+    }
+
+    func testMaxDeferralFlushesDuringContinuousPokes() async {
+        var saves = 0
+        let saver = DocSaver(save: {
+            saves += 1
+            return true
+        }, quietDebounceNs: 5_000_000_000, maxDeferralNs: 400_000_000)
+
+        for _ in 0..<20 {
+            saver.poke()
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+
+        XCTAssertGreaterThanOrEqual(saves, 1)
+    }
+
+    func testDebounceUsesBackgroundHook() async {
+        var saves = 0
+        var backgroundFlushes = 0
+        let saver = DocSaver(save: {
+            saves += 1
+            return true
+        }, quietDebounceNs: 100_000_000, maxDeferralNs: 10_000_000_000)
+        saver.background = {
+            backgroundFlushes += 1
+            return true
+        }
+
+        saver.poke()
+        try? await Task.sleep(nanoseconds: 300_000_000)
+
+        XCTAssertEqual(saves, 0)
+        XCTAssertEqual(backgroundFlushes, 1)
+        XCTAssertFalse(saver.isDirty)
+    }
+
+    func testSnapshotExporterSerializesExports() async {
+        let firstStarted = expectation(description: "first export started")
+        let gate = DispatchSemaphore(value: 0)
+        var secondStarted = false
+        let first = Task {
+            await SnapshotExporter.shared.export {
+                firstStarted.fulfill()
+                gate.wait()
+                return Data([1])
+            }
+        }
+        await fulfillment(of: [firstStarted], timeout: 1)
+        let second = Task {
+            await SnapshotExporter.shared.export {
+                secondStarted = true
+                return Data([2])
+            }
+        }
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertFalse(secondStarted)
+
+        gate.signal()
+        let firstResult = await first.value
+        let secondResult = await second.value
+        XCTAssertEqual(firstResult, Data([1]))
+        XCTAssertEqual(secondResult, Data([2]))
+        XCTAssertTrue(secondStarted)
     }
 
     func testRealStoreAsyncFlushPersistsOutbox() async throws {
