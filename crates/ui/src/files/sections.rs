@@ -19,8 +19,8 @@ use std::hash::{Hash, Hasher};
 
 use chrono::{DateTime, Utc};
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, Context, EntityId, MouseButton, SharedString, Window,
-    div, prelude::*, px,
+    Animation, AnimationExt as _, AnyElement, Context, EntityId, MouseButton, ScrollHandle,
+    SharedString, Window, div, prelude::*, px,
 };
 use zeron_doc::{MessagePart, SubagentStatus};
 use zeron_proto::{Chat, ChatIndicator};
@@ -36,11 +36,21 @@ const SECTION_HEADER_HEIGHT: f32 = 28.0;
 const SECTION_BODY_INSET: f32 = 4.0;
 const ROW_HEIGHT: f32 = 29.0;
 const ROW_GAP: f32 = 2.0;
-/// Empty-state copy: two 16px lines' worth so the sentence can wrap in a
-/// narrow explorer instead of clipping.
-const EMPTY_LINE_HEIGHT: f32 = 36.0;
-/// The Chats empty state's action row (Fork / New side chat pills).
-const EMPTY_ACTIONS_HEIGHT: f32 = 34.0;
+/// Empty state: a quiet icon, the copy (two 16px lines so it can wrap in a
+/// narrow explorer), and for Chats a row of pill actions — sized so an
+/// empty section still reads as a place, not a gap.
+const EMPTY_ICON_BLOCK: f32 = 30.0;
+const EMPTY_COPY_HEIGHT: f32 = 36.0;
+const EMPTY_ACTIONS_HEIGHT: f32 = 40.0;
+const EMPTY_PAD: f32 = 10.0;
+/// Fade band under a section list's edges (the sidebar's treatment, scaled
+/// to the shorter lists).
+const LIST_FADE_BAND: f32 = 16.0;
+/// Hover group of a section header (reveals its actions).
+const HEADER_GROUP: &str = "files-section-header";
+/// The drag handle pill revealed on the seam.
+const HANDLE_WIDTH: f32 = 36.0;
+const HANDLE_HEIGHT: f32 = 4.0;
 /// Rows a section shows before "Show more" pages it, and the page size —
 /// the sidebar's Archived shelf numbers.
 const INITIAL_ROWS: usize = 10;
@@ -119,6 +129,9 @@ pub(super) struct ExplorerSections {
     motion: HashMap<Section, DisclosureMotion>,
     /// Rows revealed per section ("Show more" pages this up).
     shown: HashMap<Section, usize>,
+    /// One scroll handle per section list, so the edge fades can read
+    /// overflow at paint time.
+    scroll: HashMap<Section, ScrollHandle>,
     /// The footer's height budget when its content wants more (persisted by
     /// the shell); shorter content shrinks the footer to fit.
     pub(super) height: f32,
@@ -137,6 +150,12 @@ impl Default for ExplorerSections {
                 .collect(),
             motion: HashMap::new(),
             shown: HashMap::new(),
+            scroll: [
+                (Section::Subagents, ScrollHandle::new()),
+                (Section::Chats, ScrollHandle::new()),
+            ]
+            .into_iter()
+            .collect(),
             height: crate::settings::FILES_SECTIONS_DEFAULT,
             resizing: false,
             fingerprint: 0,
@@ -175,6 +194,13 @@ impl ExplorerSections {
         );
         let open = self.is_open(section);
         self.open.insert(section, !open);
+    }
+
+    fn scroll(&self, section: Section) -> ScrollHandle {
+        self.scroll
+            .get(&section)
+            .cloned()
+            .unwrap_or_else(ScrollHandle::new)
     }
 
     fn live_motion(&self, section: Section) -> Option<DisclosureMotion> {
@@ -323,7 +349,9 @@ pub(super) fn fingerprint(state: &AppState, chat_id: &str, now: DateTime<Utc>) -
 pub(super) fn content_height(section: Section, count: usize, shown: usize) -> f32 {
     if count == 0 {
         return SECTION_BODY_INSET
-            + EMPTY_LINE_HEIGHT
+            + EMPTY_PAD * 2.0
+            + EMPTY_ICON_BLOCK
+            + EMPTY_COPY_HEIGHT
             + match section {
                 Section::Chats => EMPTY_ACTIONS_HEIGHT,
                 Section::Subagents => 0.0,
@@ -433,8 +461,6 @@ impl FilesSurface {
             .w_full()
             .flex()
             .flex_col()
-            .border_t_1()
-            .border_color(theme.border)
             .px(px(6.0))
             .pt(px(FOOTER_PAD_TOP))
             .pb(px(FOOTER_PAD_BOTTOM))
@@ -477,18 +503,36 @@ impl FilesSurface {
             .occlude()
             .cursor_row_resize()
             .flex()
-            .flex_col()
+            .items_center()
             .justify_center()
+            // With no hairline between tree and footer, the affordance is
+            // the handle itself: a short pill that rises on hover and stays
+            // lit while dragging, plus a full hairline while the seam moves.
             .child(
                 div()
+                    .absolute()
+                    .left_0()
+                    .right_0()
                     .h(px(1.0))
-                    .w_full()
                     .bg(if active {
                         theme.border_strong
                     } else {
                         theme.border_strong.opacity(0.0)
+                    }),
+            )
+            .child(
+                div()
+                    .w(px(HANDLE_WIDTH))
+                    .h(px(HANDLE_HEIGHT))
+                    .rounded_full()
+                    .bg(if active {
+                        theme.text_muted
+                    } else {
+                        theme.text_muted.opacity(0.0)
                     })
-                    .group_hover("files-sections-seam", |s| s.bg(theme.border_strong)),
+                    .group_hover("files-sections-seam", |s| {
+                        s.bg(theme.text_muted.opacity(0.6))
+                    }),
             )
             .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
             .on_drag(SectionsResize, |_, _, _, cx| cx.new(|_| DragGhost))
@@ -512,12 +556,16 @@ impl FilesSurface {
     /// "+" and fork beside the Chats caret: a fresh side chat of the active
     /// chat, or a fork of it through its latest completed response.
     fn render_chats_header_actions(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        // Hidden until the header is hovered, like the sidebar's row menus:
+        // the caret is the resting state, the actions appear on approach.
         div()
             .flex_none()
             .flex()
             .flex_row()
             .items_center()
             .gap(px(2.0))
+            .opacity(0.0)
+            .group_hover(HEADER_GROUP, |s| s.opacity(1.0))
             .child(
                 header_action(
                     "files-sections-new-chat",
@@ -577,6 +625,7 @@ impl FilesSurface {
                 "files-section-{}",
                 section.key()
             )))
+            .group(HEADER_GROUP)
             .role(gpui::Role::Button)
             .aria_label(SharedString::from(format!(
                 "{} {}",
@@ -740,6 +789,7 @@ impl FilesSurface {
     ) -> AnyElement {
         if rows.is_empty() {
             return empty_state(
+                icons::BOT,
                 "Subagents will appear here when they are created",
                 None,
                 theme,
@@ -747,7 +797,8 @@ impl FilesSurface {
         }
         let now = Utc::now();
         let shown = self.sections.shown(Section::Subagents);
-        let mut list = row_list("files-subagent-rows");
+        let scroll = self.sections.scroll(Section::Subagents);
+        let mut list = row_list("files-subagent-rows", &scroll);
         for row in rows.iter().take(shown) {
             let glyph = status_glyph(
                 format!("files-subagent-{}", row.doc_id),
@@ -784,7 +835,7 @@ impl FilesSurface {
                 cx,
             ));
         }
-        list.into_any_element()
+        faded_list(list, &scroll)
     }
 
     fn render_chat_rows(
@@ -798,6 +849,7 @@ impl FilesSurface {
                 .flex()
                 .flex_row()
                 .items_center()
+                .justify_center()
                 .gap(px(6.0))
                 .h(px(EMPTY_ACTIONS_HEIGHT))
                 .child(
@@ -826,6 +878,7 @@ impl FilesSurface {
                 )
                 .into_any_element();
             return empty_state(
+                icons::CHAT_ROUND_LINE,
                 "Side chats will appear here when they are created",
                 Some(actions),
                 theme,
@@ -833,7 +886,8 @@ impl FilesSurface {
         }
         let view = cx.entity_id();
         let shown = self.sections.shown(Section::Chats);
-        let mut list = row_list("files-chat-rows");
+        let scroll = self.sections.scroll(Section::Chats);
+        let mut list = row_list("files-chat-rows", &scroll);
         for row in rows.iter().take(shown) {
             let glyph = status_glyph(
                 format!("files-chat-{}", row.chat_id),
@@ -858,7 +912,7 @@ impl FilesSurface {
         if rows.len() > shown {
             list = list.child(self.render_show_more(Section::Chats, rows.len() - shown, theme, cx));
         }
-        list.into_any_element()
+        faded_list(list, &scroll)
     }
 }
 
@@ -925,30 +979,69 @@ fn pill_button(
 }
 
 /// The scrolling column an open section's rows live in; the body frame
-/// sets the height, the list fills it.
-fn row_list(id: &'static str) -> gpui::Stateful<gpui::Div> {
+/// sets the height, the list fills it and reports its overflow through
+/// `scroll` for the edge fades.
+fn row_list(id: &'static str, scroll: &ScrollHandle) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
-        .h_full()
+        .size_full()
         .flex()
         .flex_col()
         .gap(px(ROW_GAP))
         .pt(px(SECTION_BODY_INSET))
         .overflow_y_scroll()
+        .track_scroll(scroll)
 }
 
-fn empty_state(copy: &'static str, actions: Option<AnyElement>, theme: &Theme) -> AnyElement {
+/// A section list under the sidebar's overflow fades: rows dissolve at the
+/// edges while there is more to scroll to, plain when everything fits.
+fn faded_list(list: gpui::Stateful<gpui::Div>, scroll: &ScrollHandle) -> AnyElement {
+    crate::edge_fade::edge_faded(
+        LIST_FADE_BAND,
+        true,
+        true,
+        div().relative().size_full().child(list),
+    )
+    .fade_overflow_y(scroll)
+    .into_any_element()
+}
+
+/// An empty section: a faint icon, the copy centered beneath it, and any
+/// actions on a row below — enough presence that the section reads as a
+/// place waiting to fill, not a stray caption.
+fn empty_state(
+    icon_path: &'static str,
+    copy: &'static str,
+    actions: Option<AnyElement>,
+    theme: &Theme,
+) -> AnyElement {
     div()
-        .pt(px(SECTION_BODY_INSET))
+        .pt(px(SECTION_BODY_INSET + EMPTY_PAD))
+        .pb(px(EMPTY_PAD))
         .px(px(Theme::SPACE_SM))
         .flex()
         .flex_col()
+        .items_center()
         .child(
             div()
-                .min_h(px(EMPTY_LINE_HEIGHT))
-                .max_h(px(EMPTY_LINE_HEIGHT))
+                .h(px(EMPTY_ICON_BLOCK))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    icon(icon_path)
+                        .size(px(18.0))
+                        .text_color(theme.text_muted.opacity(0.35)),
+                ),
+        )
+        .child(
+            div()
+                .min_h(px(EMPTY_COPY_HEIGHT))
+                .max_h(px(EMPTY_COPY_HEIGHT))
+                .max_w(px(220.0))
                 .overflow_hidden()
                 .py(px(2.0))
+                .text_center()
                 .text_size(crate::typography::ui_rems(12.0))
                 .line_height(px(16.0))
                 .text_color(theme.text_muted.opacity(0.5))
@@ -1180,11 +1273,13 @@ mod tests {
             paged,
             SECTION_BODY_INSET + 36.0 * ROW_HEIGHT + 35.0 * ROW_GAP
         );
-        // Empty sections want their copy; Chats adds the action row.
-        assert!(
+        // Empty sections want their icon + copy; Chats adds the action row.
+        assert_eq!(
             content_height(Section::Chats, 0, INITIAL_ROWS)
-                > content_height(Section::Subagents, 0, INITIAL_ROWS)
+                - content_height(Section::Subagents, 0, INITIAL_ROWS),
+            EMPTY_ACTIONS_HEIGHT
         );
+        assert!(content_height(Section::Subagents, 0, INITIAL_ROWS) >= 80.0);
     }
 
     #[test]

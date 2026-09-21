@@ -1043,7 +1043,17 @@ impl FilesSurface {
         use gpui::Focusable;
         let include_ignored = self.tree.include_ignored();
         let search_focus = self.search.focus_handle(cx);
-        toolbar(theme)
+        // The explorer's toolbar is bare: no hairlines, no raised wash —
+        // the pane reads as one quiet column (the editor keeps the shared
+        // bordered toolbar for its breadcrumbs).
+        div()
+            .h(px(crate::surface_chrome::HEADER_HEIGHT))
+            .w_full()
+            .flex_none()
+            .px(px(crate::surface_chrome::EDGE_INSET))
+            .flex()
+            .items_center()
+            .gap(px(crate::surface_chrome::CONTROL_GAP))
             .id("files-explorer-header")
             .debug_selector(|| "files-explorer-header".into())
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
@@ -1058,7 +1068,10 @@ impl FilesSurface {
                     .debug_selector(|| "files-search".into())
                     .overflow_hidden()
                     .cursor_text()
-                    .hover(|style| style.bg(crate::theme::ink(0.055)))
+                    // No box around search: the magnifier and placeholder
+                    // alone mark the field, a hover wash the hit area.
+                    .bg(gpui::transparent_black())
+                    .hover(|style| style.bg(crate::theme::wash(0.04)))
                     // Clicking the field's padding focuses the input too.
                     .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| {
                         window.focus(&search_focus, cx);

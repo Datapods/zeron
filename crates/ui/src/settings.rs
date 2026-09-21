@@ -38,8 +38,8 @@ pub const FILES_PANEL_MIN: f32 = 220.0;
 pub const FILES_PANEL_MAX: f32 = 440.0;
 /// The explorer footer (Subagents / Chats) height budget, dragged at its
 /// seam with the tree.
-pub const FILES_SECTIONS_DEFAULT: f32 = 300.0;
-pub const FILES_SECTIONS_MIN: f32 = 120.0;
+pub const FILES_SECTIONS_DEFAULT: f32 = 340.0;
+pub const FILES_SECTIONS_MIN: f32 = 260.0;
 pub const FILES_SECTIONS_MAX: f32 = 720.0;
 
 pub fn clamp_files_sections_height(height: f32) -> f32 {
