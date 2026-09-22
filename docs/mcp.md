@@ -129,7 +129,9 @@ falls back to starting a turn if the live runtime has already exited.
 
 Claude uses `priority: "next"` and confirms consumption through replayed user
 messages. Cursor uses the SDK's native `Run.steer`, waits for active tools to
-finish, and retains input until its delivery acknowledgment. These are mid-turn
+finish, and retains input until its delivery acknowledgment. New injections do
+not wait for earlier delivery acknowledgments; that wait serializes responses
+even when the SDK reports a single active turn. These are mid-turn
 paths; they do not terminate the harness process. Adapters that only accept input
 between turns are labeled **Send next** in the composer.
 
@@ -141,6 +143,11 @@ six-message burst; select an inexpensive model with `ZERON_TEST_MODEL` and the
 harness with `ZERON_TEST_HARNESS`. Codex is checked for child survival during
 the active tool: its runtime cleans up background jobs on normal tool completion
 even without steering. Other providers also check a job that outlives that tool.
+
+For conversational redirection, run `cargo run -p zeron-harness --example
+cursor_steering_probe -- gemini-3-flash`. It sends six bare digits during streamed
+prose and requires only the latest requested answer. Counting turn completions
+alone cannot distinguish real steering from serial responses inside one run.
 
 `wait_for_turn` after a send is edge-triggered on the `Session` row captured
 before the send: it returns on a new `last_completed_turn`, an

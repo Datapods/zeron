@@ -62,8 +62,22 @@ function instance(store) {
         },80);
       }
       let steerTimer;
+      const concurrent = [];
       return {id:runId,
         async steer(text){
+          if (['native-concurrent','native-mixed'].includes(prompt)) {
+            onDelta({update:{type:'thinking-delta',text:'submitted:'+text}});
+            const acknowledgment = new Promise(resolve => concurrent.push({text,resolve}));
+            if (concurrent.length === 3) {
+              onDelta({update:{type:'text-delta',text:'NATIVE:'+text}});
+              for (const entry of [...concurrent].reverse()) {
+                if (prompt === 'native-mixed' && entry === concurrent[0]) entry.resolve('revert_to_followup');
+                else { store.logPrompt(entry.text); entry.resolve('complete_delivered'); }
+              }
+              setTimeout(()=>finish('finished'),50);
+            }
+            return acknowledgment;
+          }
           if(prompt === 'native-revert') {await finish('finished'); return 'revert_to_followup';}
           if (!toolFinished) throw new Error('steering killed the active shell');
           if(!['native-steer','native-tool'].includes(prompt)) return 'revert_to_followup';
@@ -87,7 +101,7 @@ function instance(store) {
             return pending;
           }
           if(prompt==='auth-error')return {status:'error',error:{message:'ERROR_NOT_LOGGED_IN'}};
-          if(['hang','hung-cancel','native-steer','native-revert','native-tool'].includes(prompt))return pending;
+          if(['hang','hung-cancel','native-steer','native-revert','native-tool','native-concurrent','native-mixed'].includes(prompt))return pending;
           await finish('finished');return {status:'finished'};
         },
       };

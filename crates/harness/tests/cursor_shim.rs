@@ -640,3 +640,69 @@ async fn native_steering_waits_for_tool_completion_but_not_turn_completion() {
     assert_eq!(frame(&mut lines).await["status"], "finished");
     finish(&mut child, stdin).await;
 }
+
+#[tokio::test]
+async fn newer_steers_submit_while_earlier_delivery_is_unacknowledged() {
+    use tokio::io::AsyncWriteExt;
+    let fixture = SessionFixture::new();
+    let (mut child, mut stdin, mut lines) = fixture.start("native-concurrent", false).await;
+    while frame(&mut lines).await["ev"] != "text" {}
+    // Wait for each submission before sending the next. This is not a single
+    // stdin burst: none of the delivery promises resolves until all three arrive.
+    for i in 0..3 {
+        stdin
+            .write_all(format!("{{\"op\":\"steer\",\"prompt\":\"message-{i}\"}}\n").as_bytes())
+            .await
+            .unwrap();
+        let submitted = frame(&mut lines).await;
+        assert_eq!(submitted["ev"], "thinking");
+        assert_eq!(submitted["text"], format!("submitted:message-{i}"));
+    }
+    let mut responses = Vec::new();
+    let mut acknowledgments = 0;
+    loop {
+        let event = frame(&mut lines).await;
+        match event["ev"].as_str().unwrap() {
+            "text" => responses.push(event["text"].as_str().unwrap().to_owned()),
+            "steered" => acknowledgments += 1,
+            "turn" => break,
+            other => panic!("unexpected {other}: {event}"),
+        }
+    }
+    assert_eq!(responses, ["NATIVE:message-2"]);
+    assert_eq!(acknowledgments, 3);
+    finish(&mut child, stdin).await;
+}
+
+#[tokio::test]
+async fn concurrent_boundary_race_retries_only_undelivered_input() {
+    use tokio::io::AsyncWriteExt;
+    let fixture = SessionFixture::new();
+    let (mut child, mut stdin, mut lines) = fixture.start("native-mixed", false).await;
+    while frame(&mut lines).await["ev"] != "text" {}
+    for i in 0..3 {
+        stdin
+            .write_all(format!("{{\"op\":\"steer\",\"prompt\":\"mixed-{i}\"}}\n").as_bytes())
+            .await
+            .unwrap();
+    }
+    let mut turns = 0;
+    let mut acknowledgments = 0;
+    while turns < 2 {
+        let event = frame(&mut lines).await;
+        match event["ev"].as_str().unwrap() {
+            "turn" => turns += 1,
+            "steered" => acknowledgments += 1,
+            "text" | "thinking" => {}
+            other => panic!("unexpected {other}: {event}"),
+        }
+    }
+    assert_eq!(acknowledgments, 3);
+    finish(&mut child, stdin).await;
+    let store =
+        std::fs::read_to_string(fixture.dir.path().join("state/by-agent/agent-fixture")).unwrap();
+    let prompts =
+        std::fs::read_to_string(std::path::Path::new(store.trim()).join("prompts.ndjson")).unwrap();
+    assert_eq!(prompts.lines().count(), 4);
+    assert_eq!(prompts.lines().last().unwrap(), r#""mixed-0""#);
+}

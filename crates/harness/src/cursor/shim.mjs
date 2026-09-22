@@ -270,7 +270,14 @@ async function recordNativeSteer(text) {
     fs.renameSync(temporary, receiptPath);
   };
   persist();
-  return () => { receipt.nativeSteers = entries.filter(value => value !== entry); persist(); };
+  return () => {
+    // Other submissions may have persisted since this injection was sent.
+    const latest = JSON.parse(fs.readFileSync(receiptPath, "utf8"));
+    latest.nativeSteers = (latest.nativeSteers ?? []).filter(value =>
+      value.text !== entry.text || value.occurrence !== entry.occurrence);
+    Object.assign(receipt, latest);
+    persist();
+  };
 }
 
 // ---- models mode ----------------------------------------------------------
@@ -438,6 +445,7 @@ function withAuthHint(message) {
 // Keep ownership until Cursor confirms that the active turn appended the text.
 // A boundary race returns revert_to_followup; only those messages start a turn.
 const pendingSteers = [];
+const steerDeliveries = new Set();
 let steerPump = null;
 let turnActive = false;
 function pumpSteers() {
@@ -449,17 +457,32 @@ function pumpSteers() {
       if (typeof target.steer !== "function") {
         throw new Error("Cursor SDK lacks native steering; update the managed SDK");
       }
-      const message = pendingSteers[0];
-      if (message.revertedRun === target) return;
+      const message = pendingSteers.find(message => !message.submitted && message.revertedRun !== target);
+      if (!message) return;
       const reverted = await recordNativeSteer(message.prompt);
       // History lookup can yield while another tool starts. Never let native
       // steering cancel its shell/process tree; inject at the tool boundary.
       if (activeTools.size) { reverted(); return; }
-      const outcome = await target.steer(message.prompt);
-      if (outcome === "revert_to_followup") { message.revertedRun = target; reverted(); return; }
-      if (outcome !== "complete_delivered") throw new Error(`Unknown Cursor steering acknowledgment: ${outcome}`);
-      pendingSteers.shift();
-      out({ev: "steered"});
+      message.submitted = true;
+      // Cursor's client submits each injection independently. Awaiting its
+      // terminal delivery acknowledgment here serializes model responses.
+      const delivery = target.steer(message.prompt).then(outcome => {
+        if (outcome === "revert_to_followup") {
+          message.revertedRun = target;
+          reverted();
+        } else if (outcome === "complete_delivered") {
+          message.delivered = true;
+        } else {
+          throw new Error(`Unknown Cursor steering acknowledgment: ${outcome}`);
+        }
+        // The engine owns an ordered mailbox even when SDK acks arrive out of order.
+        while (pendingSteers[0]?.delivered) {
+          pendingSteers.shift();
+          out({ev: "steered"});
+        }
+      });
+      steerDeliveries.add(delivery);
+      void delivery.catch(fatal).finally(() => steerDeliveries.delete(delivery));
     }
   })().finally(() => { steerPump = null; });
   return steerPump;
@@ -467,9 +490,12 @@ function pumpSteers() {
 async function followupSteers() {
   while (pendingSteers.length && !interrupted && !closing) {
     const batch = pendingSteers.splice(0);
-    const prompt = batch.length === 1 ? batch[0].prompt :
+    // A later input can be delivered before an earlier one is rejected.
+    // Never replay the delivered input when draining the rejected prefix.
+    const undelivered = batch.filter(message => !message.delivered);
+    const prompt = undelivered.length === 1 ? undelivered[0].prompt :
       "These user messages arrived together. Address them together in order:\n" +
-      JSON.stringify(batch.map(message => message.prompt));
+      JSON.stringify(undelivered.map(message => message.prompt));
     await runTurn(prompt, undefined, () => {
       for (const message of batch) out({ev: "steered"});
     });
@@ -526,6 +552,7 @@ async function runTurn(prompt, ready, accepted) {
   }
   activeTools.clear();
   await pumpSteers();
+  await Promise.all(steerDeliveries);
   run = null;
   turnActive = false;
   out({
