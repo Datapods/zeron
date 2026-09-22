@@ -25,13 +25,19 @@ originating chat in the environment:
 When `ZERON_CHAT_ID` is set, every `send_message` is prefixed with a
 `[Message from Zeron chat <title> (<id8>) …]` line so the receiving agent and the
 human reading that transcript can tell an agent-to-agent message from a typed
-one, and the server refuses to message its own chat.
+one, and the server refuses to message its own chat. The transcript renders
+this routing header as “Message from **chat name**”, keeping the full routing
+instructions in the stored prompt for agents.
 
 ### Parent links
 
 A chat created through `create_chat` records the creating chat as its parent:
 `Chat.parent_chat_id` (proto) ⇄ `parentChatId` on the registry/workspace chat
 row (`Mutate createChat { parentChatId? }` → `WorkspaceHost::create_chat_with_parent`).
+Chats with a parent cannot create chats through MCP, including batch creation
+or an explicit parent override. A side chat cannot be selected as a parent;
+only one level of side chats is supported.
+
 The default is the origin chat (`ZERON_CHAT_ID`); an explicit `parent` argument
 (id, prefix, or title) overrides it. `list_chats { parent }` returns a chat's
 children, and every chat summary carries `parentChatId`. The field is additive

@@ -1315,6 +1315,7 @@ pub fn rows_for_entry(
         // Lifted before the mention projection, so a comment body's own
         // Markdown never lands in the bubble.
         let (body, badges) = crate::badges::split(&parsed.text);
+        let body = agent_message_display(&body);
         let (text, mentions) = match crate::composer::sent_mention_display(&body) {
             Some((display, spans)) => (display, spans),
             None => (body, Vec::new()),
@@ -7587,6 +7588,28 @@ impl Transcript {
 /// run when there are none), with the same selection machinery as rendered
 /// markdown — the element registers into the frame's document-ordered
 /// registry, so drags select, span into adjacent rows, and Cmd+C copies.
+/// Keep routing instructions in the stored prompt for agents, but show a
+/// concise attribution in the human transcript (including existing messages).
+fn agent_message_display(text: &str) -> String {
+    let Some(rest) = text.strip_prefix("[Message from Zeron chat ") else {
+        return text.to_owned();
+    };
+    let Some((header, body)) = rest.split_once("]\n\n") else {
+        return text.to_owned();
+    };
+    let Some((label, id)) =
+        header.rsplit_once(". Reply to it with the Zeron `send_message` tool, chat ")
+    else {
+        return text.to_owned();
+    };
+    let Some(id) = id.strip_suffix('.') else {
+        return text.to_owned();
+    };
+    let suffix = format!(" ({id})");
+    let name = label.strip_suffix(&suffix).unwrap_or(label);
+    format!("Message from {name}\n\n{body}")
+}
+
 fn user_bubble_text(
     row_id: &SharedString,
     text: SharedString,
@@ -7625,6 +7648,39 @@ fn user_bubble_text(
     }
     if at < text.len() {
         runs.push(body_run(text.len() - at));
+    }
+    // Attribution names are bold sans text, never Markdown/italic. Split
+    // existing runs so file-mention styling and selection offsets stay intact.
+    if let Some(rest) = text.strip_prefix("Message from ")
+        && let Some((name, _)) = rest.split_once("\n\n")
+    {
+        let bold = "Message from ".len().."Message from ".len() + name.len();
+        let mut offset = 0;
+        runs = runs
+            .into_iter()
+            .flat_map(|run| {
+                let end = offset + run.len;
+                let mut pieces = Vec::new();
+                while offset < end {
+                    let in_name = bold.contains(&offset);
+                    let next = if offset < bold.start {
+                        end.min(bold.start)
+                    } else if in_name {
+                        end.min(bold.end)
+                    } else {
+                        end
+                    };
+                    let mut piece = run.clone();
+                    piece.len = next - offset;
+                    if in_name {
+                        piece.font.weight = gpui::FontWeight::BOLD;
+                    }
+                    pieces.push(piece);
+                    offset = next;
+                }
+                pieces
+            })
+            .collect();
     }
     let styled = StyledText::new(text.clone()).with_runs(runs);
     let layout = styled.layout().clone();

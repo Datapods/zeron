@@ -596,6 +596,13 @@ impl Tools {
     }
 
     async fn create_chat(&self, args: CreateChatArgs) -> anyhow::Result<Value> {
+        if let Some(origin) = self.zeron.origin().chat_id.as_deref() {
+            let chat = self.zeron.resolve_chat(origin).await?;
+            anyhow::ensure!(
+                chat.parent_chat_id.is_none(),
+                "Side chats cannot create chats. Ask your parent chat to create another side chat."
+            );
+        }
         let harnesses = self.zeron.harnesses().await?;
         let harness = match args.harness.as_deref() {
             Some(raw) => {
@@ -665,6 +672,13 @@ impl Tools {
             None => self.zeron.origin().chat_id.clone(),
         };
 
+        if let Some(parent) = parent_chat_id.as_deref() {
+            let chat = self.zeron.resolve_chat(parent).await?;
+            anyhow::ensure!(
+                chat.parent_chat_id.is_none(),
+                "Cannot create a child of a side chat. Choose a top-level parent chat."
+            );
+        }
         let chat_id = uuid::Uuid::new_v4().to_string();
         let mut mutate = json!({
             "op": "createChat",
@@ -1101,6 +1115,7 @@ mod tests {
     struct World {
         writes: Mutex<Vec<(String, Value)>>,
         dispatch_barrier: Option<tokio::sync::Barrier>,
+        beta_parent: Option<String>,
     }
 
     fn stream(item: Value) -> RpcReply {
@@ -1132,6 +1147,7 @@ mod tests {
                     },
                     {
                         "id": "chat-beta-2", "deviceId": "dev-local", "title": "Beta",
+                        "parentChatId": self.beta_parent,
                         "archived": false, "spaceId": "space-1",
                         "createdAt": "2026-09-02T00:00:00Z"
                     }
@@ -1435,6 +1451,48 @@ mod tests {
                 );
             }
         }
+        assert!(world.writes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn side_chats_cannot_create_chats_or_be_parents() {
+        let world = Arc::new(World {
+            beta_parent: Some("chat-alpha-1".into()),
+            ..Default::default()
+        });
+        let side = tools(
+            world.clone(),
+            Origin {
+                chat_id: Some("chat-beta-2".into()),
+                device_id: None,
+            },
+        );
+        for args in [json!({}), json!({"parent":"Alpha"})] {
+            assert!(
+                side.call("create_chat", args)
+                    .await
+                    .unwrap_err()
+                    .contains("Side chats cannot")
+            );
+        }
+        let batch = side
+            .call("create_chats", json!({"requests":[{}, {"parent":"Alpha"}]}))
+            .await
+            .unwrap();
+        assert!(
+            batch["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|r| r["isError"] == true)
+        );
+        let root = tools(world.clone(), Origin::default());
+        assert!(
+            root.call("create_chat", json!({"parent":"Beta"}))
+                .await
+                .unwrap_err()
+                .contains("child of a side chat")
+        );
         assert!(world.writes.lock().unwrap().is_empty());
     }
 
