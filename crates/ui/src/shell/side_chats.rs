@@ -217,8 +217,12 @@ impl Shell {
             cx.subscribe(&transcript, Self::on_transcript_event),
             cx.subscribe(&composer, {
                 let transcript = transcript.clone();
-                move |_: &mut Self, _, event, cx| {
-                    transcript.update(cx, |t, cx| match event {
+                move |this: &mut Self, _, event, cx| {
+                    match event {
+                        ComposerEvent::WorkspaceCommand(command) => {
+                            this.pending_workspace_command = Some(*command);
+                            cx.notify();
+                        }
                         // A side chat is already minted before its composer mounts,
                         // and it inherits its parent's checkout, so it never runs
                         // worktree setup of its own.
@@ -227,12 +231,16 @@ impl Shell {
                         ComposerEvent::Sent {
                             chat_id,
                             message_id,
-                        } => t.on_own_send(chat_id.clone(), message_id.clone(), cx),
+                        } => transcript.update(cx, |t, cx| {
+                            t.on_own_send(chat_id.clone(), message_id.clone(), cx)
+                        }),
                         ComposerEvent::Queued {
                             chat_id,
                             message_id,
-                        } => t.on_own_queued_send(chat_id.clone(), message_id.clone(), cx),
-                    })
+                        } => transcript.update(cx, |t, cx| {
+                            t.on_own_queued_send(chat_id.clone(), message_id.clone(), cx)
+                        }),
+                    }
                 }
             }),
             cx.observe(&state, |this, state, cx| {
