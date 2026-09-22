@@ -1725,7 +1725,10 @@ pub fn rows_for_entry(
     // (chat-view.tsx: "No timestamp hover mid-stream"). The version bit keeps
     // the diff key honest for last-row kinds whose own version wouldn't
     // change when streaming flips off (chips).
-    if !streaming && let Some(last) = rows.last_mut() {
+    if !streaming
+        && let Some(last) = rows.last_mut()
+        && !matches!(last.kind, RowKind::ForkMarker { .. })
+    {
         last.timestamp = Some(entry.created_at);
         last.copy_text = assistant_copy_text(entry);
         last.version ^= 1 << 62;
@@ -7693,39 +7696,46 @@ fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
         .into_any_element()
 }
 
-/// The fork seam: a dashed rule broken by "This chat was forked from
-/// <source>", the source title in the body color so the eye lands on where
-/// the history came from. Quiet on purpose — it is orientation, not content.
+/// A quiet fork seam. The source gets its own constrained line so long
+/// titles cannot widen a narrow side-chat pane. No message metadata lane.
 fn fork_marker(source_title: SharedString, theme: &Theme) -> AnyElement {
-    // A painted 1px hairline rather than a border: a bordered box this
-    // thin does not draw on the Linux backend (verified on the rig).
-    let rule = || div().flex_1().h(px(1.0)).bg(theme.border_strong);
+    let rule = || div().flex_1().min_w_0().h(px(1.0)).bg(theme.border_strong);
     div()
         .py(px(14.0))
         .w_full()
+        .min_w_0()
+        .overflow_hidden()
         .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(12.0))
-        .child(rule())
+        .flex_col()
+        .gap(px(6.0))
         .child(
             div()
-                .flex_none()
+                .w_full()
+                .min_w_0()
                 .flex()
-                .flex_row()
                 .items_center()
-                .gap(px(4.0))
-                .text_size(crate::typography::ui_rems(13.0))
-                .text_color(theme.text_muted.opacity(0.7))
-                .child("This chat was forked from")
+                .gap(px(10.0))
+                .child(rule())
                 .child(
                     div()
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(theme.text_muted)
-                        .child(source_title),
-                ),
+                        .flex_none()
+                        .text_size(crate::typography::ui_rems(12.0))
+                        .text_color(theme.text_muted.opacity(0.7))
+                        .child("Forked from"),
+                )
+                .child(rule()),
         )
-        .child(rule())
+        .child(
+            div()
+                .w_full()
+                .min_w_0()
+                .truncate()
+                .text_center()
+                .text_size(crate::typography::ui_rems(13.0))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(theme.text_muted)
+                .child(source_title),
+        )
         .into_any_element()
 }
 
