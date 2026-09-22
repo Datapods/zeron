@@ -2259,6 +2259,7 @@ impl Shell {
                 crate::sound::SessionNotificationState,
                 bool,
                 Option<String>,
+                bool,
             );
             let (sessions, connectivity, connectivity_observed) = {
                 let state = state.read(cx);
@@ -2268,12 +2269,10 @@ impl Shell {
                     .map(|s| {
                         let status = crate::sound::SessionNotificationState::new(s, now);
                         let send_pending = state.send_pending(&s.chat_id, now);
-                        let title = state
-                            .chats
-                            .iter()
-                            .find(|c| c.id == s.chat_id)
-                            .and_then(|c| c.title.clone());
-                        (s.chat_id.clone(), status, send_pending, title)
+                        let chat = state.chats.iter().find(|c| c.id == s.chat_id);
+                        let title = chat.and_then(|c| c.title.clone());
+                        let notify = chat.is_some_and(|c| c.parent_chat_id.is_none());
+                        (s.chat_id.clone(), status, send_pending, title, notify)
                     })
                     .collect();
                 (
@@ -2287,9 +2286,12 @@ impl Shell {
             // focused app still stays a chime — you're already looking at
             // Zeron; the sidebar dot carries the rest.
             let app_focused = cx.active_window().is_some();
-            for (chat_id, status, send_pending, title) in sessions {
+            for (chat_id, status, send_pending, title, notify) in sessions {
                 let prev = self.sound_prev.insert(chat_id.clone(), status.clone());
-                if let Some(prev) = prev
+                // Keep side-chat baselines current, but never emit their
+                // completion, input-request, or failure sounds/banners.
+                if notify
+                    && let Some(prev) = prev
                     && let Some(sound) = status.sound_since(&prev, send_pending)
                 {
                     if self.settings.session_sound_enabled(sound) {
@@ -3090,6 +3092,7 @@ impl Shell {
                     // surface never emits them.
                     FilesEvent::OpenSubagent { .. }
                     | FilesEvent::OpenChildChat(_)
+                    | FilesEvent::ChildChatContextMenu { .. }
                     | FilesEvent::NewChildChat
                     | FilesEvent::ForkChat => {}
                     FilesEvent::CloseCancelled => {
@@ -7990,6 +7993,13 @@ impl Shell {
             let chat_id = menu_state.chat_id;
             let position = menu_state.position;
             let chat_menu_closing = self.chat_menu.closing_since();
+            let is_side_chat = matches!(menu_state.tab, Some((_, RightSurface::SideChat(_))))
+                || self
+                    .state
+                    .read(cx)
+                    .chats
+                    .iter()
+                    .any(|chat| chat.id == chat_id && chat.parent_chat_id.is_some());
             let is_pinned = self.active_sidebar_pins(cx).contains(&chat_id);
             let rename_id = chat_id.clone();
             let pin_id = chat_id.clone();
@@ -8014,17 +8024,22 @@ impl Shell {
                             .child(icon(icons::PEN).size(px(16.0)).text_color(theme.text_muted))
                             .child(SharedString::from("Rename…")),
                     )
-                    .child(
-                        popover::menu_row(&theme, false, format!("chat-menu-pin-{chat_id}"))
-                            .id("chat-menu-pin")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.set_chat_pinned(pin_id.clone(), !is_pinned, cx)
-                            }))
-                            .child(icon(icons::PIN).size(px(16.0)).text_color(theme.text_muted))
-                            .child(SharedString::from(if is_pinned { "Unpin" } else { "Pin" })),
-                    )
-                    .child(
-                        popover::menu_row(&theme, false, format!("chat-menu-archive-{chat_id}"))
+                    .when(!is_side_chat, |menu| {
+                        menu.child(
+                            popover::menu_row(&theme, false, format!("chat-menu-pin-{chat_id}"))
+                                .id("chat-menu-pin")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.set_chat_pinned(pin_id.clone(), !is_pinned, cx)
+                                }))
+                                .child(icon(icons::PIN).size(px(16.0)).text_color(theme.text_muted))
+                                .child(SharedString::from(if is_pinned { "Unpin" } else { "Pin" })),
+                        )
+                        .child(
+                            popover::menu_row(
+                                &theme,
+                                false,
+                                format!("chat-menu-archive-{chat_id}"),
+                            )
                             .id("chat-menu-archive")
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.archive_chat(archive_id.clone(), cx)
@@ -8035,23 +8050,26 @@ impl Shell {
                                     .text_color(theme.text_muted),
                             )
                             .child(SharedString::from("Archive")),
-                    )
-                    .child(
-                        popover::menu_row(&theme, false, format!("chat-menu-copy-{chat_id}"))
-                            .id("chat-menu-copy")
-                            .on_click(cx.listener(|this, _, _, cx| this.open_chat_copy_menu(cx)))
-                            .child(
-                                icon(icons::COPY)
-                                    .size(px(16.0))
-                                    .text_color(theme.text_muted),
-                            )
-                            .child(div().flex_1().child(SharedString::from("Copy")))
-                            .child(
-                                icon(icons::ALT_ARROW_RIGHT)
-                                    .size(px(14.0))
-                                    .text_color(theme.text_muted),
-                            ),
-                    )
+                        )
+                        .child(
+                            popover::menu_row(&theme, false, format!("chat-menu-copy-{chat_id}"))
+                                .id("chat-menu-copy")
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.open_chat_copy_menu(cx)),
+                                )
+                                .child(
+                                    icon(icons::COPY)
+                                        .size(px(16.0))
+                                        .text_color(theme.text_muted),
+                                )
+                                .child(div().flex_1().child(SharedString::from("Copy")))
+                                .child(
+                                    icon(icons::ALT_ARROW_RIGHT)
+                                        .size(px(14.0))
+                                        .text_color(theme.text_muted),
+                                ),
+                        )
+                    })
                     .child(popover::menu_separator())
                     .child(
                         popover::menu_row(&theme, false, format!("chat-menu-delete-{chat_id}"))

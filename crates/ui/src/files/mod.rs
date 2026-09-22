@@ -160,6 +160,10 @@ pub enum FilesEvent {
     },
     /// A footer row: open this side chat (by id) in the right pane.
     OpenChildChat(String),
+    ChildChatContextMenu {
+        chat_id: String,
+        position: Point<Pixels>,
+    },
     /// The Chats header's "+": start a fresh side chat of the active chat.
     NewChildChat,
     /// The Chats header's fork: fork the active chat into a side chat.

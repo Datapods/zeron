@@ -793,6 +793,7 @@ impl FilesSurface {
                 cx,
             );
             let open_id = row.chat_id.clone();
+            let menu_id = row.chat_id.clone();
             list = list.child(
                 compact_row(format!("files-chat-{}", row.chat_id), theme)
                     .aria_label(SharedString::from(format!("Open side chat {}", row.title)))
@@ -800,6 +801,16 @@ impl FilesSurface {
                         cx.stop_propagation();
                         cx.emit(FilesEvent::OpenChildChat(open_id.clone()));
                     }))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |_, event: &gpui::MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            cx.emit(FilesEvent::ChildChatContextMenu {
+                                chat_id: menu_id.clone(),
+                                position: event.position,
+                            });
+                        }),
+                    )
                     .child(glyph)
                     .child(row_title(
                         format!("files-chat-title-{}", row.chat_id),

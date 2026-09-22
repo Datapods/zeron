@@ -202,6 +202,15 @@ impl Shell {
                         cx,
                     ),
                     FilesEvent::OpenChildChat(chat_id) => this.open_child_chat_tab(chat_id, cx),
+                    FilesEvent::ChildChatContextMenu { chat_id, position } => {
+                        this.chat_menu.open(ChatMenuState {
+                            chat_id: chat_id.clone(),
+                            tab: None,
+                            position: *position,
+                            page: ChatMenuPage::Root,
+                        });
+                        cx.notify();
+                    }
                     FilesEvent::NewChildChat => this.create_child_chat(None, cx),
                     FilesEvent::ForkChat => this.create_side_chat(cx),
                     _ => cx.notify(),
