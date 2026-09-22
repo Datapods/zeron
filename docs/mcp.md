@@ -120,10 +120,12 @@ Watch streams are the engine's only read surface (there is no one-shot "get
 transcript" RPC); a snapshot is "subscribe, take the first item, drop" — drop
 cancels server-side, exactly what the sidebar does on attach.
 
-`send_message` mode `auto` mirrors the composer: idle → `run`; working → `steer`
-when the harness steers mid-turn (claude, codex), else a queue row held for the
-end of the turn; `awaitingInput` → refuses and points at `respond_to_input`.
-A working row older than 45 s is treated as idle (the UI's staleness window).
+`send_message` mode `auto` starts idle chats and steers working chats through
+their live mailbox without interrupting tools or child processes. Providers
+consume it at their next supported input boundary. Only explicit `queue` mode
+creates a held queue row. `awaitingInput` refuses and points at
+`respond_to_input`. Quiet, long-running turns still receive steering; the host
+falls back to starting a turn if the live runtime has already exited.
 
 `wait_for_turn` after a send is edge-triggered on the `Session` row captured
 before the send: it returns on a new `last_completed_turn`, an

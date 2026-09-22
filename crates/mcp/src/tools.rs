@@ -141,7 +141,7 @@ fn catalog() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "send_message",
-            description: "Send a message to a chat. Messages are attributed to your chat. mode 'auto' starts a turn when the chat is idle, steers a running turn when the harness supports it, and otherwise queues for the end of the turn. With wait=true, blocks until the turn finishes and returns the assistant's reply. For parallel work use send_messages, or send to all chats with wait=false before waiting.",
+            description: "Send a message to a chat. Messages are attributed to your chat. mode 'auto' starts a turn when the chat is idle, steers a running turn through its live mailbox (at the next supported input boundary without interrupting the agent). Use mode 'queue' only to explicitly hold a message for later. With wait=true, blocks until the turn finishes and returns the assistant's reply. For parallel work use send_messages, or send to all chats with wait=false before waiting.",
             input_schema: chat_key_schema(json!({
                 "text": { "type": "string" },
                 "mode": { "type": "string", "enum": ["auto", "run", "steer", "queue"], "default": "auto" },
@@ -951,28 +951,14 @@ impl Tools {
             .as_ref()
             .map(|c| c.harness)
             .map_or_else(|| default_harness(harnesses), Ok)?;
-        let info = harnesses.iter().find(|h| h.id == harness);
         let (status, _) = status_of(session);
-        let live = session
-            .map(|s| {
-                let stale = chrono::Utc::now() - s.updated_at > SESSION_STALE;
-                if stale && s.status == SessionStatus::Working {
-                    SessionStatus::Idle
-                } else {
-                    s.status
-                }
-            })
-            .unwrap_or(SessionStatus::Idle);
+        // A quiet tool call can outlive the UI's stale-status window. Route
+        // through steering and let the host decide whether a live run exists.
+        let live = session.map(|s| s.status).unwrap_or(SessionStatus::Idle);
         let chosen = match mode {
             "auto" => match live {
                 SessionStatus::Idle | SessionStatus::Errored => "run",
-                SessionStatus::Working => {
-                    if info.is_some_and(HarnessInfo::steers_mid_turn) {
-                        "steer"
-                    } else {
-                        "queue"
-                    }
-                }
+                SessionStatus::Working => "steer",
                 SessionStatus::AwaitingInput => anyhow::bail!(
                     "chat {} is waiting for an answer; use respond_to_input (or mode 'queue' to hold this message for after the turn)",
                     short(&chat.id)
@@ -1271,6 +1257,38 @@ mod tests {
         assert_eq!(params["command"]["request"]["cwd"], "/repo/comet");
         assert_eq!(params["command"]["request"]["harness"], "claude-code");
         assert_eq!(params["command"]["request"]["model"], "opus");
+    }
+
+    #[tokio::test]
+    async fn auto_steers_busy_chats_even_at_turn_boundaries_or_after_long_quiet_tools() {
+        let world = Arc::new(World::default());
+        let tools = tools(world.clone(), Origin::default());
+        let chats = tools.zeron.chats().await.unwrap();
+        let session = Session {
+            chat_id: chats[0].id.clone(),
+            device_id: "dev-local".into(),
+            status: SessionStatus::Working,
+            started_at: None,
+            updated_at: chrono::Utc::now() - chrono::Duration::minutes(10),
+            last_completed_turn: None,
+        };
+        // No mid-turn capability is required for a live mailbox delivery.
+        let sent = tools
+            .deliver(
+                &chats[0],
+                None,
+                &[],
+                Some(&session),
+                "follow up".into(),
+                "auto",
+            )
+            .await
+            .unwrap();
+        assert_eq!(sent["delivery"], "steer");
+        let writes = world.writes.lock().unwrap();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].0, methods::QUEUE_COMMAND);
+        assert_eq!(writes[0].1["command"]["kind"], "steer");
     }
 
     #[tokio::test]

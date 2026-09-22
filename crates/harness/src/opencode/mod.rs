@@ -1806,7 +1806,13 @@ async fn run_session(session: Session) {
                 session_id: Some(session_id.clone()),
             }).await;
             done_sent = true;
-            break $label;
+            if errored || !steering_open {
+                break $label;
+            }
+            // Keep the mailbox and server alive between successful turns.
+            // Closing here races the engine's next queued dispatch: it may
+            // accept a prompt into a dying mailbox and replay it out of order.
+            continue $label;
         }};
     }
 
@@ -1829,6 +1835,8 @@ async fn run_session(session: Session) {
 
         tokio::select! {
             biased;
+
+            _ = event_tx.closed() => break 'main,
 
             _ = interrupt.cancelled(), if !interrupt_requested => {
                 interrupt_requested = true;
@@ -1964,7 +1972,10 @@ async fn run_session(session: Session) {
                             }
                         }
                     }
-                    None => steering_open = false,
+                    None => {
+                        steering_open = false;
+                        if !turn.active { break 'main; }
+                    },
                 }
             }
 

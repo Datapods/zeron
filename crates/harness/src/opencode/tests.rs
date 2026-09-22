@@ -15,6 +15,7 @@ struct TurnWire {
     requests: mpsc::UnboundedReceiver<String>,
     events: mpsc::Receiver<Result<AgentEvent, HarnessError>>,
     interrupt: tokio_util::sync::CancellationToken,
+    steering: Option<mpsc::Sender<crate::SteerMessage>>,
     polls: Arc<std::sync::atomic::AtomicUsize>,
     command_failure_release: Option<tokio::sync::oneshot::Sender<()>>,
     server: tokio::task::JoinHandle<()>,
@@ -240,7 +241,10 @@ impl TurnWire {
                 .await
                 .unwrap();
         }
-        drop(steer_tx);
+        let retained_steering = overrides["keepSteering"]
+            .as_bool()
+            .unwrap_or(false)
+            .then_some(steer_tx);
         let interrupt = tokio_util::sync::CancellationToken::new();
         let mut request = json!({"prompt": if native_command_reply.is_some() { "/project-review" } else { "first" }, "cwd":"", "sandbox":"workspace-write", "autoApprove": auto_approve, "model": if v2 { Some("opencode/muse") } else { None }, "reasoning": "low"});
         request
@@ -289,6 +293,7 @@ impl TurnWire {
             requests,
             events,
             interrupt,
+            steering: retained_steering,
             polls,
             command_failure_release: matches!(
                 native_command_reply,
@@ -340,6 +345,46 @@ impl TurnWire {
         .await
         .unwrap()
     }
+}
+
+#[tokio::test]
+async fn completed_turn_keeps_mailbox_alive_for_the_next_queued_request() {
+    let mut wire = TurnWire::start_config(
+        false,
+        false,
+        true,
+        None,
+        "1.18.21",
+        json!({ "keepSteering": true }),
+        false,
+    )
+    .await;
+    wire.request("/prompt_async").await;
+    wire.status("busy");
+    wire.status("idle");
+    wire.idle();
+    assert_eq!(wire.done().await.0, DoneStatus::Completed);
+    assert!(!wire.run.is_finished());
+    wire.steering
+        .as_ref()
+        .unwrap()
+        .send(crate::SteerMessage {
+            prompt: "after completion".into(),
+            message_id: Some("second".into()),
+        })
+        .await
+        .unwrap();
+    wire.request("/prompt_async").await;
+    wire.status("busy");
+    wire.status("idle");
+    wire.idle();
+    assert_eq!(wire.done().await.0, DoneStatus::Completed);
+    assert!(!wire.run.is_finished());
+    drop(wire.steering.take());
+    tokio::time::timeout(Duration::from_secs(5), &mut wire.run)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test]

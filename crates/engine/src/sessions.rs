@@ -394,7 +394,6 @@ impl SessionsEngine {
             let accepted = if steerable && same_runtime {
                 // Warm dispatch uses the same mailbox as explicit steering.
                 // Register acceptance before a fast boundary can retire it.
-                let mut pending = lock(&ledger);
                 let message = SteerMessage {
                     // OpenCode must see the canonical selection before it
                     // decodes the provider command: a project-scoped command
@@ -406,11 +405,13 @@ impl SessionsEngine {
                     },
                     message_id: Some(user_id.clone()),
                 };
-                if steer_tx.try_send(message).is_ok() {
+                if let Ok(permit) = steer_tx.reserve().await {
+                    let mut pending = lock(&ledger);
                     pending.push_back(RoutedSteer {
                         prompt: request.prompt.clone(),
                         message_id: user_id.clone(),
                     });
+                    permit.send(message);
                     true
                 } else {
                     false
@@ -588,17 +589,20 @@ impl SessionsEngine {
             },
             message_id: Some(user_id.clone()),
         };
+        // Saturation is backpressure, not a dead runtime. Waiting for room
+        // preserves the live process and every accepted message in a burst.
+        let Ok(permit) = steer_tx.reserve().await else {
+            return Ok(SteerOutcome::NotSteerable);
+        };
         {
             // Serialize mailbox acceptance with confirmation and Done-time
             // inspection: a fast consumer must never outrun its ledger entry.
             let mut pending = lock(&ledger);
-            if steer_tx.try_send(message).is_err() {
-                return Ok(SteerOutcome::NotSteerable);
-            }
             pending.push_back(RoutedSteer {
                 prompt: prompt.to_string(),
                 message_id: user_id.clone(),
             });
+            permit.send(message);
         }
         let handle = self.doc_handle(chat_id)?;
         handle.write_user_message(&user_id, prompt, now_ms())?;
@@ -2471,9 +2475,15 @@ async fn drive_run(
                 saw_session_started = true;
                 idle_since = Some(tokio::time::Instant::now());
                 self_continued_turn = false;
+                // Accepted steers still own this runtime. Publishing Idle
+                // here lets the ordinary queue overtake that continuation.
                 inner.set_status_with_completion(
                     &chat_id,
-                    SessionStatus::Idle,
+                    if pending_steer {
+                        SessionStatus::Working
+                    } else {
+                        SessionStatus::Idle
+                    },
                     false,
                     completed_turn,
                 );

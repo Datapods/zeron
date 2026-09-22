@@ -512,6 +512,8 @@ pub struct ChatDocHandle {
     /// the turn and starting its own the chat reads Idle, and an idle chat with
     /// a queue is exactly what the flush drains.
     drain_lock: tokio::sync::Mutex<()>,
+    /// Serialize prompt commands while still allowing interrupt/input controls.
+    command_drain_lock: tokio::sync::Mutex<()>,
     /// An explicit user interrupt freezes automatic queue delivery. The next
     /// explicit prompt or queue send resumes it; incidental doc/status changes
     /// must not turn Cancel into "send the next row".
@@ -1345,6 +1347,7 @@ impl DocHost {
             transcript_history,
             queue_tx,
             drain_lock: tokio::sync::Mutex::new(()),
+            command_drain_lock: tokio::sync::Mutex::new(()),
             queue_paused: AtomicBool::new(recovered_queue_pending),
             mirror_dirty: AtomicBool::new(true),
             last_access: AtomicI64::new(now_ms()),
@@ -3020,8 +3023,8 @@ impl DocHost {
 
     /// Promote one held row without ever interrupting a turn. A live,
     /// steerable turn receives it as steering; if that turn has already ended,
-    /// it starts normally as the next turn. Unsupported harnesses and
-    /// attachment-bearing rows stay untouched.
+    /// it starts normally as the next turn. Turn-boundary providers retain it
+    /// in their mailbox until ready. Attachment-bearing rows stay untouched.
     pub async fn steer_queued_now(&self, chat_id: &str, id: &str) -> Result<bool, EngineError> {
         if !self.is_host(chat_id) {
             return Err(EngineError::Other(format!(
@@ -3031,14 +3034,6 @@ impl DocHost {
         }
         let handle = self.open(chat_id)?;
         let _drain = handle.drain_lock.lock().await;
-        let Some(sessions) = self.sessions() else {
-            return Err(EngineError::Other("sessions engine not wired".into()));
-        };
-        if !sessions.steers_mid_turn(self.harness_for(chat_id)) {
-            return Err(EngineError::Other(
-                "the selected agent cannot accept mid-turn steering".into(),
-            ));
-        }
         let Some(candidate) = handle
             .doc
             .read_queue()?
@@ -3654,6 +3649,14 @@ impl DocHost {
         let sessions = self
             .sessions()
             .ok_or_else(|| EngineError::Other("executor unavailable".into()))?;
+        let _prompt_guard = if matches!(
+            entry.payload,
+            SessionCommandPayload::Run { .. } | SessionCommandPayload::Steer { .. }
+        ) {
+            Some(handle.command_drain_lock.lock().await)
+        } else {
+            None
+        };
         let commands = handle.doc.read_commands()?;
         let messages = handle.doc.read_entries().unwrap_or_default();
         let current_turn_id = messages.last().map(|m| m.id.clone());
@@ -3935,12 +3938,24 @@ impl DocHost {
     /// Drain pending commands (host-only): evaluate → mark processed BEFORE execute →
     /// execute → write the outcome as the sole outcome writer.
     pub async fn drain_commands(&self, handle: &Arc<ChatDocHandle>) {
+        self.drain_command_kind(handle, false).await;
+    }
+
+    async fn drain_command_kind(&self, handle: &Arc<ChatDocHandle>, controls_only: bool) {
         let Some(sessions) = self.sessions() else {
             return; // executor not wired yet (or retired); the set_sessions kick re-drains
         };
         if !self.is_host(&handle.chat_id) {
             return;
         }
+        // Do not let another drain overtake a prompt waiting for mailbox
+        // capacity (or preflight). Controls bypass this lock so a stalled
+        // provider can still be interrupted or have its question answered.
+        let mut prompt_guard = if controls_only {
+            None
+        } else {
+            handle.command_drain_lock.try_lock().ok()
+        };
         // Entries this pass decided to leave alone (processed dedupe hits).
         let mut skipped: HashSet<String> = HashSet::new();
         loop {
@@ -3981,9 +3996,21 @@ impl DocHost {
                     c.status == SessionCommandStatus::Pending
                         && !skipped.contains(&c.id)
                         && !is_processed(&c.id)
+                        && (prompt_guard.is_some()
+                            || !matches!(
+                                c.payload,
+                                SessionCommandPayload::Run { .. }
+                                    | SessionCommandPayload::Steer { .. }
+                            ))
                 })
                 .cloned()
             else {
+                if prompt_guard.is_none() && !controls_only {
+                    // Wait after handling controls, then re-read: simply
+                    // returning here could miss a newly appended prompt.
+                    prompt_guard = Some(handle.command_drain_lock.lock().await);
+                    continue;
+                }
                 return;
             };
             let messages = handle.doc.read_entries().unwrap_or_default();
@@ -4379,8 +4406,7 @@ impl DocHost {
     /// the chat row the same way — sessions.ts:601-620); dispatch's engine-owned
     /// resume then reattaches the prior harness conversation.
     ///
-    /// A working agent that only takes prompts at a turn boundary is the
-    /// exception: see [`Self::held_until_turn_end`].
+    /// Turn-boundary drivers retain explicit steers until their next boundary.
     async fn deliver_prompt(
         &self,
         sessions: &SessionsEngine,
@@ -4390,15 +4416,10 @@ impl DocHost {
         issued_at: i64,
     ) -> Result<(SessionCommandStatus, Option<String>), EngineError> {
         let chat_id = &handle.chat_id;
-        // Keep upstream's queued-attachment rewrite and send-time canonical
-        // history while preserving the personal cut's turn-boundary queue.
+        // Explicit steering always uses the persistent run mailbox. Drivers
+        // consume at their supported boundary; ordinary sends still use the
+        // editable pending-message queue. Never interrupt to hurry steering.
         let prompt = self.resolve_prompt_attachments(prompt);
-        if self.held_until_turn_end(sessions, chat_id, &prompt, message_id.as_deref())? {
-            return Ok((
-                SessionCommandStatus::Applied,
-                Some("held until the turn ends".into()),
-            ));
-        }
         if let Some(message_id) = message_id.as_deref()
             && let Err(err) =
                 handle.write_user_message(message_id, &prompt, issued_at.min(now_ms()))
@@ -4435,51 +4456,6 @@ impl DocHost {
                 ))
             }
         }
-    }
-
-    /// Put `prompt` in the pending-message queue instead of a run mailbox when
-    /// the agent is working and takes prompts only between turns. `true` when it
-    /// was queued.
-    ///
-    /// A turn-boundary agent has no mid-turn mailbox: what it has is a next
-    /// prompt. Posting into the run's mailbox anyway made delivery depend on how
-    /// the turn ended — a turn that was interrupted or errored discarded the
-    /// mailbox, and the message sat in the transcript looking sent, unread. The
-    /// queue is the honest home: shown as pending rather than sent, editable,
-    /// and flushed by the turn-end watcher, which is where [`Self::drain_queue`]
-    /// already sends a typed message for exactly this agent. `steers_mid_turn`
-    /// is a catalog lookup — no spawn, no probe.
-    fn held_until_turn_end(
-        &self,
-        sessions: &SessionsEngine,
-        chat_id: &str,
-        prompt: &str,
-        message_id: Option<&str>,
-    ) -> Result<bool, EngineError> {
-        // A persistent session parked BETWEEN turns DOES take the next prompt
-        // through its mailbox (the warm-child fast path), so the question is
-        // whether a turn is in flight — including one parked on a question,
-        // which is the state a question's own follow-up arrives in. An empty
-        // prompt is no message to queue.
-        if !sessions.turn_in_flight(chat_id)
-            || prompt.trim().is_empty()
-            || sessions.steers_mid_turn(self.harness_for(chat_id))
-        {
-            return Ok(false);
-        }
-        let handle = self.open(chat_id)?;
-        handle.doc.push_queued(&QueuedMessage {
-            id: message_id.map(str::to_string).unwrap_or_else(new_id),
-            text: prompt.to_string(),
-            attachments: Vec::new(),
-            hold_for_turn_end: false,
-            issued_by: self.inner.config.device_id.clone(),
-            issued_at: now_ms(),
-            edited_at: None,
-            delivery_gate: None,
-        })?;
-        handle.publish_queue();
-        Ok(true)
     }
 
     async fn capture_source_context(&self, cwd: &str) -> Option<ConversationSourceContext> {
@@ -5077,6 +5053,23 @@ mod queued_message_prompt_tests {
 /// by re-publishing the transcript watch, draining commands, and debouncing snapshots.
 /// Holds only a weak handle so a dropped host tears the task down.
 async fn chat_task(host: DocHost, weak: Weak<ChatDocHandle>, mut changed_rx: watch::Receiver<u64>) {
+    // Prompt delivery may wait for mailbox capacity. Keep a separate watcher
+    // for interrupt/question controls so that wait cannot block recovery.
+    let control_host = host.clone();
+    let control_weak = weak.clone();
+    let mut control_changes = changed_rx.clone();
+    host.spawn_worker(async move {
+        loop {
+            let Some(handle) = control_weak.upgrade() else {
+                break;
+            };
+            control_host.drain_command_kind(&handle, true).await;
+            drop(handle);
+            if control_changes.changed().await.is_err() {
+                break;
+            }
+        }
+    });
     // Initial pass: the snapshot may already carry pending commands. The
     // mirror stays lazy — it materializes on the first watch attach.
     {

@@ -37,6 +37,7 @@ struct HeldHarness {
     finish: tokio::sync::broadcast::Sender<()>,
     prompts: Arc<Mutex<Vec<String>>>,
     requests: Mutex<Vec<RunRequest>>,
+    mailbox_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
     /// Park the first turn on a question instead of just hanging, so the chat
     /// sits in `AwaitingInput` rather than `Working`.
     asks: bool,
@@ -60,6 +61,7 @@ impl HeldHarness {
                 finish,
                 prompts: prompts.clone(),
                 requests: Mutex::new(Vec::new()),
+                mailbox_gate: Mutex::new(None),
                 asks,
             }),
             prompts,
@@ -105,8 +107,10 @@ impl Harness for HeldHarness {
                 multi_select: false,
             }]);
         }
-        let mut finish = self.finish.subscribe();
-        let mut steering = controls.steering;
+        let finish = self.finish.subscribe();
+        let steering = controls.steering;
+        let prompts = self.prompts.clone();
+        let gate = self.mailbox_gate.lock().unwrap().take();
         let started = futures::stream::iter(vec![Ok(AgentEvent::SessionStarted {
             harness: HarnessId::Mock,
             model: "mock-1".into(),
@@ -115,31 +119,33 @@ impl Harness for HeldHarness {
             session_id: "sess-queue".into(),
             assistant_message_id: format!("a-{}", request.prompt),
         })]);
-        let done = futures::stream::once(async move {
-            loop {
-                tokio::select! {
-                    _ = finish.recv() => {
-                        return Ok(AgentEvent::Done {
-                            status: DoneStatus::Completed,
-                            result: None,
-                            error: None,
-                            session_id: Some("sess-queue".into()),
-                        });
-                    }
-                    steer = steering.recv() => {
-                        if steer.is_none() {
-                            return Ok(AgentEvent::Done {
-                                status: DoneStatus::Completed,
-                                result: None,
-                                error: None,
-                                session_id: Some("sess-queue".into()),
-                            });
-                        }
-                    }
+        let done = futures::stream::unfold(
+            (finish, steering, prompts, false),
+            |(mut finish, mut steering, prompts, ended)| async move {
+                if ended {
+                    return None;
                 }
+                let (event, ended) = tokio::select! {
+                    _ = finish.recv() => (AgentEvent::Done { status: DoneStatus::Completed, result: None, error: None, session_id: Some("sess-queue".into()) }, true),
+                    steer = steering.recv() => match steer {
+                        Some(message) => {
+                            prompts.lock().unwrap().push(message.prompt);
+                            (AgentEvent::Steered { assistant_message_id: None, next_assistant_message_id: Some(uuid::Uuid::new_v4().to_string()) }, false)
+                        }
+                        None => (AgentEvent::Done { status: DoneStatus::Completed, result: None, error: None, session_id: Some("sess-queue".into()) }, true),
+                    }
+                };
+                Some((Ok(event), (finish, steering, prompts, ended)))
+            },
+        );
+        let gated = futures::stream::once(async move {
+            if let Some(gate) = gate {
+                gate.notified().await;
             }
-        });
-        Ok(started.chain(done).boxed())
+            done
+        })
+        .flatten();
+        Ok(started.chain(gated).boxed())
     }
 }
 
@@ -504,16 +510,10 @@ async fn cancelling_a_turn_freezes_the_queue_until_an_explicit_send() {
     core.shutdown().await;
 }
 
-/// A `Steer` command asks for the running turn directly — a client that decided
-/// for itself, and the path a question's follow-up prompt takes. It obeys the
-/// same rule as a typed message: a turn-boundary agent's mailbox is not read
-/// mid-turn, so the prompt is held rather than posted into it.
-///
-/// Posting it anyway is the 2026-08-13 report: on `cursor-agent` the follow-up
-/// went into the mailbox, the turn ended interrupted, and the message sat in the
-/// transcript looking sent with the agent never seeing it.
+/// Explicit steering uses the live mailbox even for turn-boundary providers.
+/// Normal typed messages still wait in the editable queue.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_steer_command_holds_for_an_agent_that_takes_no_mid_turn_prompt() {
+async fn a_steer_command_uses_the_live_mailbox_for_turn_boundary_agents() {
     let (core, harness, prompts) = setup(SteeringMode::TurnBoundary).await;
 
     core.doc_host
@@ -535,24 +535,108 @@ async fn a_steer_command_holds_for_an_agent_that_takes_no_mid_turn_prompt() {
         )
         .expect("queue steer command");
     wait_for(
-        || queue_texts(&core) == vec!["and also this"],
-        "the steer to be held in the queue",
-    )
-    .await;
-    // Held means held: not shown as sent, and not with the agent.
-    assert!(!user_messages(&core).iter().any(|m| m == "and also this"));
-    assert!(!prompts.lock().unwrap().iter().any(|p| p == "and also this"));
-
-    // And it goes on its own when the turn ends — nobody re-sends it.
-    let _ = harness.finish.send(());
-    wait_for(
         || prompts.lock().unwrap().iter().any(|p| p == "and also this"),
-        "the held steer to flush at turn end",
+        "the steer to reach the live mailbox",
     )
     .await;
+    assert!(user_messages(&core).iter().any(|m| m == "and also this"));
     assert!(queue_texts(&core).is_empty());
+    assert_eq!(
+        harness.requests.lock().unwrap().len(),
+        1,
+        "steering must not restart the runtime"
+    );
 
     let _ = harness.finish.send(());
+    core.shutdown().await;
+}
+
+/// A full mailbox must apply backpressure, never kill the healthy runtime.
+#[tokio::test]
+async fn saturated_steering_mailbox_waits_without_restarting_or_losing_messages() {
+    let (core, harness, prompts) = setup(SteeringMode::StepBoundary).await;
+    let gate = Arc::new(tokio::sync::Notify::new());
+    *harness.mailbox_gate.lock().unwrap() = Some(gate.clone());
+    core.doc_host
+        .queue_message(CHAT, "opening", vec![])
+        .unwrap();
+    wait_for(|| prompts.lock().unwrap().len() == 1, "opening turn").await;
+    let sessions = core.sessions.clone();
+    let sending = tokio::spawn(async move {
+        for i in 0..40 {
+            assert!(matches!(
+                sessions
+                    .steer(CHAT, &format!("burst {i}"), Some(format!("burst-{i}")))
+                    .await
+                    .unwrap(),
+                zeron_engine::SteerOutcome::Accepted
+            ));
+        }
+    });
+    wait_for(|| user_messages(&core).len() == 33, "mailbox to fill").await;
+    assert!(!sending.is_finished(), "saturation must wait for capacity");
+    assert_eq!(harness.requests.lock().unwrap().len(), 1);
+    gate.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), sending)
+        .await
+        .unwrap()
+        .unwrap();
+    wait_for(
+        || prompts.lock().unwrap().len() == 41,
+        "all accepted messages",
+    )
+    .await;
+    let mut expected = vec!["opening".to_owned()];
+    expected.extend((0..40).map(|i| format!("burst {i}")));
+    assert_eq!(*prompts.lock().unwrap(), expected);
+    assert_eq!(user_messages(&core), expected);
+    assert_eq!(harness.requests.lock().unwrap().len(), 1);
+    harness.finish.send(()).unwrap();
+    core.shutdown().await;
+}
+
+/// Backpressure must not block the separate control path used to stop a stuck agent.
+#[tokio::test]
+async fn interrupt_bypasses_a_saturated_prompt_command_drain() {
+    let (core, harness, prompts) = setup(SteeringMode::StepBoundary).await;
+    *harness.mailbox_gate.lock().unwrap() = Some(Arc::new(tokio::sync::Notify::new()));
+    core.doc_host
+        .queue_message(CHAT, "opening", vec![])
+        .unwrap();
+    wait_for(|| prompts.lock().unwrap().len() == 1, "opening turn").await;
+    for i in 0..40 {
+        core.doc_host
+            .queue_command(
+                CHAT,
+                SessionCommandPayload::Steer {
+                    prompt: format!("blocked {i}"),
+                    message_id: Some(format!("blocked-{i}")),
+                },
+            )
+            .unwrap();
+    }
+    wait_for(
+        || user_messages(&core).len() >= 34,
+        "blocked command after full mailbox",
+    )
+    .await;
+    let interrupt = core
+        .doc_host
+        .queue_command(CHAT, SessionCommandPayload::Interrupt {})
+        .unwrap();
+    let handle = core.doc_host.open(CHAT).unwrap();
+    wait_for(
+        || {
+            handle
+                .doc()
+                .read_commands()
+                .unwrap()
+                .iter()
+                .any(|c| c.id == interrupt && c.status == zeron_doc::SessionCommandStatus::Applied)
+        },
+        "interrupt to bypass blocked prompts",
+    )
+    .await;
     core.shutdown().await;
 }
 
@@ -570,7 +654,7 @@ async fn batched_remote_steers_preserve_every_message_in_order_exactly_once() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64;
-    let expected: Vec<_> = (0..20).map(|i| format!("remote message {i}")).collect();
+    let expected: Vec<_> = (0..100).map(|i| format!("remote message {i}")).collect();
     // No await: all entries are visible together, as with a remote document import.
     for (i, prompt) in expected.iter().enumerate() {
         handle
@@ -591,10 +675,13 @@ async fn batched_remote_steers_preserve_every_message_in_order_exactly_once() {
             .unwrap();
     }
     core.doc_host.drain_commands(&handle).await;
-    assert_eq!(queue_texts(&core), expected);
-    // Repeated drains must not enqueue the same command again.
+    assert!(queue_texts(&core).is_empty());
     core.doc_host.drain_commands(&handle).await;
-    assert_eq!(queue_texts(&core), expected);
+    wait_for(
+        || prompts.lock().unwrap().len() == expected.len() + 1,
+        "all steers received",
+    )
+    .await;
     assert!(
         handle
             .doc()
@@ -603,15 +690,11 @@ async fn batched_remote_steers_preserve_every_message_in_order_exactly_once() {
             .iter()
             .all(|c| c.status == zeron_doc::SessionCommandStatus::Applied)
     );
-    for (i, prompt) in expected.iter().enumerate() {
-        harness.finish.send(()).unwrap();
-        wait_for(
-            || prompts.lock().unwrap().len() == i + 2,
-            "next queued turn",
-        )
-        .await;
-        assert_eq!(prompts.lock().unwrap()[i + 1], *prompt);
-    }
+    assert_eq!(
+        harness.requests.lock().unwrap().len(),
+        1,
+        "a burst must preserve the runtime"
+    );
     let mut all = vec!["opening".to_owned()];
     all.extend(expected);
     assert_eq!(*prompts.lock().unwrap(), all);
@@ -716,7 +799,7 @@ async fn held_policy_keeps_a_steerable_message_visible_until_steer_now() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn steer_now_leaves_the_row_when_the_agent_cannot_steer_mid_turn() {
+async fn steer_now_delivers_to_turn_boundary_mailboxes() {
     let (core, harness, prompts) = setup(SteeringMode::TurnBoundary).await;
 
     core.doc_host
@@ -732,8 +815,13 @@ async fn steer_now_leaves_the_row_when_the_agent_cannot_steer_mid_turn() {
         .queue_message(CHAT, "still queued", Vec::new())
         .expect("queue held message");
 
-    assert!(core.doc_host.steer_queued_now(CHAT, &id).await.is_err());
-    assert_eq!(queue_texts(&core), vec!["still queued"]);
+    assert!(core.doc_host.steer_queued_now(CHAT, &id).await.unwrap());
+    wait_for(
+        || prompts.lock().unwrap().iter().any(|p| p == "still queued"),
+        "live mailbox delivery",
+    )
+    .await;
+    assert!(queue_texts(&core).is_empty());
 
     let _ = harness.finish.send(());
     core.shutdown().await;
