@@ -1950,3 +1950,55 @@ async fn antigravity_detection_subprocess() {
             .unwrap_or(true)
     );
 }
+
+#[tokio::test]
+async fn mcp_injection_all_acp_harnesses_new_resume_and_fallback() {
+    for harness in [
+        AcpHarness::grok(),
+        AcpHarness::devin(),
+        AcpHarness::hermes(),
+        AcpHarness::pi(),
+        AcpHarness::antigravity(),
+    ] {
+        let harness = harness.with_executable(fixture_path());
+        for resume in [None, Some("mcp-loaded"), Some("load-fail")] {
+            let mut req = request("scenario:mcp");
+            req.model = None;
+            req.resume = resume.map(str::to_owned);
+            req.mcp = Some(zeron_proto::McpServer {
+                name: "zeron".into(),
+                command: "/path with spaces/zeron".into(),
+                args: vec!["mcp".into()],
+                env: [
+                    ("ZERON_CHAT_ID".into(), "origin-chat".into()),
+                    ("ZERON_IPC_PORT".into(), "27699".into()),
+                ]
+                .into(),
+            });
+            let (controls, _steer, _token) = controls();
+            let mut stream = harness.run(req, controls).await.unwrap();
+            let events = tokio::time::timeout(Duration::from_secs(10), async {
+                let mut events = Vec::new();
+                while let Some(event) = stream.next().await {
+                    let event = event.unwrap();
+                    let done = matches!(event, AgentEvent::Done { .. });
+                    events.push(event);
+                    if done {
+                        break;
+                    }
+                }
+                events
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{:?} {resume:?} timed out", harness.id()));
+
+            assert!(
+                events.contains(&AgentEvent::TextDelta {
+                    text: "mcp configured".into()
+                }),
+                "{:?} {resume:?}: {events:?}",
+                harness.id()
+            );
+        }
+    }
+}

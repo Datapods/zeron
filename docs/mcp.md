@@ -55,9 +55,21 @@ dialect and leaves the user's configured servers alone:
 | Harness | Where |
 | ------- | ----- |
 | Claude  | `--mcp-config <inline json>` (no `--strict-mcp-config`)             |
-| ACP (Gemini, OpenCode, Pi, …) | `session/new` → `mcpServers: [{name, command, args, env}]` |
+| ACP (Devin, Grok, Hermes, Antigravity) | `session/new` and `session/load` → `mcpServers: [{name, command, args, env}]` |
+| Pi | Per-run `--extension` bridges stdio MCP into Pi tools (`pi-acp` 0.0.33 ignores `mcpServers`) |
+| OpenCode | Child-only `OPENCODE_CONFIG_CONTENT`: `mcp.zeron` on 1.x, `mcp.servers.zeron` on 2.x |
 | Codex   | `thread/start` config overrides `mcp_servers.zeron.{command,args,env}` |
-| Cursor  | no per-invocation hook; not injected                              |
+| Cursor  | SDK `Agent.create` / `Agent.resume` → inline `mcpServers.zeron` |
+
+OpenCode preserves inherited inline configuration and other servers. Its config
+shape follows the installed binary's major version. Cursor uses the SDK's
+[inline MCP configuration](https://cursor.com/docs/sdk/typescript); OpenCode's
+[1.x config layer](https://opencode.ai/docs/config/) and
+[2.x MCP format](https://opencode.ai/v2/docs/mcp-servers) differ.
+Pi's private wrapper and extension live only for the ACP process lifetime;
+user settings, extensions, and session arguments remain intact. The bridge
+registers `zeron_<tool>` tools, propagates cancellation and errors, and closes
+the MCP child when the Pi session shuts down.
 
 Title runs never carry it. A run with no served port (embedded engine that
 lost the bind) gets no Zeron tools rather than a dead server.
@@ -89,6 +101,8 @@ name (default: the local engine's device).
 | `list_chats`       | `WatchChats` + `WatchSessions` snapshots (status merged)  |
 | `get_chat`         | above + `WatchDocMessages` opening frame (pending input)  |
 | `create_chat`      | `Mutate createChat` (+ `renameChat`; optional first send) |
+| `create_chats`     | Concurrent `create_chat` requests with per-request results |
+| `send_messages`    | Concurrent `send_message` requests with per-request results |
 | `read_chat`        | `WatchDocMessages` opening `reset` frame, rendered        |
 | `send_message`     | `QueueCommand` Run / Steer, or `QueueMessage`             |
 | `wait_for_turn`    | `WatchSessions` until the chat settles                    |
@@ -111,6 +125,32 @@ before the send: it returns on a new `last_completed_turn`, an
 edge. A brand-new chat has no session row until the host picks the run up, so
 the wait keeps waiting in that case rather than reporting the unstarted run as
 done (this was the one bug the first live run found).
+
+## Parallel side chats
+
+Use `create_chats` with a `requests` array to launch independent workers in
+one tool call, including when the harness executes its tool calls sequentially:
+
+```json
+{
+  "requests": [
+    {"project": "/repo", "title": "Review tests", "prompt": "Review test coverage"},
+    {"project": "/repo", "title": "Review API", "prompt": "Review API compatibility"}
+  ]
+}
+```
+
+Use `send_messages` with the same envelope for existing chats; each item uses
+`send_message` arguments. Both accept 1–32 requests, run them concurrently,
+and return `results` in input order with `index`, `isError`, and either `result`
+or `error`. A failed request does not cancel or roll back successful requests.
+Each request defaults to `wait: false`; explicit waits also run concurrently.
+Only batch independent work, not ordered messages to the same chat.
+
+When using individual tools, launch **all** chats/messages with `wait: false`
+first, then collect replies with `wait_for_turn`. Waiting on each individual
+launch before issuing the next serializes work at the caller, even though
+both the MCP transport and engine support concurrent chat runs.
 
 ## Smoke recipe
 

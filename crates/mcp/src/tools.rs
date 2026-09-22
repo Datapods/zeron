@@ -21,6 +21,7 @@ use crate::transcript::{RenderOptions, RenderedMessage, render_entries};
 use crate::zeron::{HarnessInfo, TurnOutcome, Zeron, session_for, short};
 
 /// Default and ceiling for the blocking waits.
+const MAX_BATCH: usize = 32;
 const DEFAULT_WAIT: Duration = Duration::from_secs(600);
 const MAX_WAIT: Duration = Duration::from_secs(3600);
 /// A session row older than this is not trusted to still be working
@@ -55,7 +56,7 @@ fn chat_key_schema(extra: Value) -> Value {
 }
 
 fn catalog() -> Vec<ToolDef> {
-    vec![
+    let mut tools = vec![
         ToolDef {
             name: "whoami",
             description: "Which chat and device this server speaks for, plus the engine's workspace mode. Call this first when you need to know your own chat id.",
@@ -108,7 +109,7 @@ fn catalog() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "create_chat",
-            description: "Create a chat in a project (or project-less on a device) with a harness and model. The new chat records your chat as its parent (parentChatId). Optionally send a first prompt and wait for the reply. Returns the new chat id.",
+            description: "Create a chat in a project (or project-less on a device) with a harness and model. The new chat records your chat as its parent (parentChatId). Optionally send a first prompt and wait for the reply. Returns the new chat id. For parallel delegation use create_chats, or leave wait=false on every launch and wait only after all chats have been started.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -140,7 +141,7 @@ fn catalog() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "send_message",
-            description: "Send a message to a chat. Messages are attributed to your chat. mode 'auto' starts a turn when the chat is idle, steers a running turn when the harness supports it, and otherwise queues for the end of the turn. With wait=true, blocks until the turn finishes and returns the assistant's reply.",
+            description: "Send a message to a chat. Messages are attributed to your chat. mode 'auto' starts a turn when the chat is idle, steers a running turn when the harness supports it, and otherwise queues for the end of the turn. With wait=true, blocks until the turn finishes and returns the assistant's reply. For parallel work use send_messages, or send to all chats with wait=false before waiting.",
             input_schema: chat_key_schema(json!({
                 "text": { "type": "string" },
                 "mode": { "type": "string", "enum": ["auto", "run", "steer", "queue"], "default": "auto" },
@@ -185,10 +186,43 @@ fn catalog() -> Vec<ToolDef> {
                 "archived": { "type": "boolean", "default": true }
             })),
         },
-    ]
+    ];
+    for (name, single, description) in [
+        (
+            "create_chats",
+            "create_chat",
+            "Create multiple independent side chats concurrently. Put each chat's prompt in its request to start all work together. Prefer this for parallel delegation, including harnesses that execute tool calls sequentially. Each request has create_chat arguments; wait defaults to false. Results preserve request order and include per-request errors; successful requests are not rolled back.",
+        ),
+        (
+            "send_messages",
+            "send_message",
+            "Send messages to multiple independent chats concurrently. Prefer this to delegate parallel work to existing chats. Each request has send_message arguments; wait defaults to false. If wait=true, requests still run concurrently. Results preserve request order and include per-request errors; successful sends are not rolled back. Do not include dependent messages to the same chat.",
+        ),
+    ] {
+        let item_schema = tools
+            .iter()
+            .find(|tool| tool.name == single)
+            .unwrap()
+            .input_schema
+            .clone();
+        tools.push(ToolDef {
+            name, description,
+            input_schema: json!({
+                "type": "object",
+                "properties": {"requests": {"type": "array", "minItems": 1, "maxItems": MAX_BATCH, "items": item_schema}},
+                "required": ["requests"],
+            }),
+        });
+    }
+    tools
 }
 
 // ---- argument shapes ---------------------------------------------------------
+
+#[derive(Deserialize)]
+struct BatchArgs {
+    requests: Vec<Value>,
+}
 
 #[derive(Deserialize)]
 struct ChatArgs {
@@ -378,6 +412,8 @@ impl Tools {
             "list_chats" => self.list_chats(parse(args)?).await,
             "get_chat" => self.get_chat(parse(args)?).await,
             "create_chat" => self.create_chat(parse(args)?).await,
+            "create_chats" => self.batch(parse(args)?, true).await,
+            "send_messages" => self.batch(parse(args)?, false).await,
             "read_chat" => self.read_chat(parse(args)?).await,
             "send_message" => self.send_message(parse(args)?).await,
             "wait_for_turn" => self.wait_for_turn(parse(args)?).await,
@@ -387,6 +423,38 @@ impl Tools {
             other => return Err(format!("unknown tool: {other}")),
         };
         result.map_err(|e| e.to_string())
+    }
+
+    /// Poll every request together, including its optional wait. A waiting
+    /// first chat must not prevent subsequent chats from receiving their work.
+    async fn batch(&self, args: BatchArgs, create: bool) -> anyhow::Result<Value> {
+        anyhow::ensure!(
+            (1..=MAX_BATCH).contains(&args.requests.len()),
+            "requests must contain between 1 and {MAX_BATCH} items"
+        );
+        let results = futures::future::join_all(args.requests.into_iter().enumerate().map(
+            |(index, args)| async move {
+                let result = if create {
+                    match serde_json::from_value(args) {
+                        Ok(args) => self.create_chat(args).await,
+                        Err(error) => Err(error.into()),
+                    }
+                } else {
+                    match serde_json::from_value(args) {
+                        Ok(args) => self.send_message(args).await,
+                        Err(error) => Err(error.into()),
+                    }
+                };
+                match result {
+                    Ok(result) => json!({"index": index, "isError": false, "result": result}),
+                    Err(error) => {
+                        json!({"index": index, "isError": true, "error": error.to_string()})
+                    }
+                }
+            },
+        ))
+        .await;
+        Ok(json!({"results": results}))
     }
 
     async fn whoami(&self) -> anyhow::Result<Value> {
@@ -1032,6 +1100,7 @@ mod tests {
     #[derive(Default)]
     struct World {
         writes: Mutex<Vec<(String, Value)>>,
+        dispatch_barrier: Option<tokio::sync::Barrier>,
     }
 
     fn stream(item: Value) -> RpcReply {
@@ -1089,6 +1158,13 @@ mod tests {
                         .lock()
                         .unwrap()
                         .push((method.to_owned(), params));
+                    if method == methods::QUEUE_COMMAND
+                        && let Some(barrier) = &self.dispatch_barrier
+                    {
+                        // No dispatch can finish until both chats have work.
+                        // A sequential batch deadlocks here, before any waits.
+                        barrier.wait().await;
+                    }
                     RpcReply::Value(json!({ "commandId": "cmd-1", "id": "q-1" }))
                 }
                 other => return Err(RpcError::UnknownMethod(other.into())),
@@ -1288,6 +1364,78 @@ mod tests {
             .unwrap();
         assert_eq!(sent["turn"]["outcome"], "timedOut");
         assert!(started.elapsed() >= Duration::from_millis(900));
+    }
+
+    #[tokio::test]
+    async fn batches_dispatch_all_chats_before_waiting_and_keep_partial_results() {
+        for (name, requests) in [
+            (
+                "create_chats",
+                json!([
+                    {"prompt": "first", "wait": true, "timeout_secs": 1},
+                    {"harness": "not-a-harness"},
+                    {"prompt": "second", "wait": true, "timeout_secs": 1},
+                ]),
+            ),
+            (
+                "send_messages",
+                json!([
+                    {"chat": "alpha", "text": "first", "wait": true, "timeout_secs": 1},
+                    {"chat": "missing", "text": "invalid"},
+                    {"chat": "beta", "text": "second", "wait": true, "timeout_secs": 1},
+                ]),
+            ),
+        ] {
+            let world = Arc::new(World {
+                dispatch_barrier: Some(tokio::sync::Barrier::new(2)),
+                ..Default::default()
+            });
+            let tools = tools(world.clone(), Origin::default());
+            let reply = tokio::time::timeout(
+                Duration::from_secs(3),
+                crate::jsonrpc::handle_request(
+                    &tools,
+                    json!(42),
+                    "tools/call",
+                    json!({"name": name, "arguments": {"requests": requests}}),
+                ),
+            )
+            .await
+            .expect("both dispatches must proceed while other requests are waiting");
+            assert_eq!(reply["result"]["isError"], false, "{reply}");
+            let results = &reply["result"]["structuredContent"]["results"];
+            for i in [0, 2] {
+                assert_eq!(results[i]["index"], i);
+                assert_eq!(results[i]["isError"], false, "{reply}");
+                assert_eq!(results[i]["result"]["turn"]["outcome"], "timedOut");
+            }
+            assert_eq!(results[1]["index"], 1);
+            assert_eq!(results[1]["isError"], true);
+            let writes = world.writes.lock().unwrap();
+            let dispatched: Vec<_> = writes
+                .iter()
+                .filter(|(method, _)| method == methods::QUEUE_COMMAND)
+                .collect();
+            assert_eq!(dispatched.len(), 2);
+            assert_ne!(dispatched[0].1["chatId"], dispatched[1].1["chatId"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_batch_sizes_have_no_side_effects() {
+        let world = Arc::new(World::default());
+        let tools = tools(world.clone(), Origin::default());
+        for name in ["create_chats", "send_messages"] {
+            for requests in [vec![], vec![json!({"prompt": "hello"}); MAX_BATCH + 1]] {
+                assert!(
+                    tools
+                        .call(name, json!({"requests": requests}))
+                        .await
+                        .is_err()
+                );
+            }
+        }
+        assert!(world.writes.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

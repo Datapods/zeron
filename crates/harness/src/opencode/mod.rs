@@ -277,19 +277,23 @@ impl OpencodeHarness {
 
     /// Boot (or attach to) a server for a run/probe. Probes have no chat cwd:
     /// they boot in the user's home, where global provider config lives.
-    async fn server(&self, cwd: Option<&str>) -> Result<Server, HarnessError> {
+    async fn server(
+        &self,
+        cwd: Option<&str>,
+        mcp: Option<&zeron_proto::McpServer>,
+    ) -> Result<Server, HarnessError> {
         if let Some(base) = &self.base_url {
             return Ok(Server::attached(base.clone()));
         }
         let exe = self.resolve_executable()?;
-        Server::spawn(&exe, cwd, self.startup_timeout).await
+        Server::spawn(&exe, cwd, self.startup_timeout, mcp).await
     }
 
     /// One short-lived server answers both discovery calls. Also primes the
     /// commands cache so concurrent picker/composer fetches share one boot.
     async fn probe_models(&self) -> Result<Vec<Model>, HarnessError> {
         let _guard = self.probe_lock.lock().await;
-        let mut server = self.server(None).await?;
+        let mut server = self.server(None, None).await?;
         let result = async {
             let providers = server.provider_catalog(None).await?;
             let mut models = models_from_providers(&providers);
@@ -321,7 +325,7 @@ impl OpencodeHarness {
         if let Some(commands) = self.commands_cache.get() {
             return Ok(commands.clone());
         }
-        let mut server = self.server(None).await?;
+        let mut server = self.server(None, None).await?;
         let result = server
             .commands_wire(None)
             .await
@@ -401,7 +405,7 @@ impl Harness for OpencodeHarness {
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let cwd = (!request.cwd.is_empty()).then(|| request.cwd.clone());
-        let server = self.server(cwd.as_deref()).await?;
+        let server = self.server(cwd.as_deref(), request.mcp.as_ref()).await?;
         let (event_tx, event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
         tokio::spawn(run_session(Session {
             server,
@@ -546,6 +550,7 @@ impl Server {
         exe: &std::path::Path,
         cwd: Option<&str>,
         startup: Duration,
+        mcp: Option<&zeron_proto::McpServer>,
     ) -> Result<Self, HarnessError> {
         let port = free_localhost_port().ok_or_else(|| {
             HarnessError::Protocol("no free localhost port for opencode serve".into())
@@ -559,6 +564,32 @@ impl Server {
             .arg("127.0.0.1")
             .env("OPENCODE_SERVER_PASSWORD", &password)
             .env("OPENCODE_CLIENT", "zeron");
+        if let Some(mcp) = mcp {
+            let version_exe = exe.to_path_buf();
+            let version = tokio::task::spawn_blocking(move || {
+                crate::executable::binary_version(&version_exe)
+            })
+            .await
+            .map_err(|e| HarnessError::Protocol(format!("opencode version probe: {e}")))?
+            .ok_or_else(|| {
+                HarnessError::Protocol(
+                    "cannot determine opencode version for MCP configuration".into(),
+                )
+            })?;
+            let protocol = if version.major >= 2 {
+                Protocol::V2
+            } else {
+                Protocol::V1
+            };
+            cmd.env(
+                "OPENCODE_CONFIG_CONTENT",
+                mcp_config(
+                    std::env::var("OPENCODE_CONFIG_CONTENT").ok().as_deref(),
+                    mcp,
+                    protocol,
+                )?,
+            );
+        }
         crate::compose_child_path(&mut cmd, exe);
         if let Some(cwd) = cwd {
             cmd.current_dir(cwd);
@@ -3787,5 +3818,172 @@ mod context_tests {
                 window: None
             })
         );
+    }
+}
+
+/// Inline config is the final user config layer. Preserve inherited overrides
+/// and other MCP servers; never write chat identity into a shared config file.
+fn mcp_config(
+    inherited: Option<&str>,
+    mcp: &zeron_proto::McpServer,
+    protocol: Protocol,
+) -> Result<String, HarnessError> {
+    let mut config: Value = match inherited.filter(|s| !s.trim().is_empty()) {
+        Some(raw) => deser_hjson::from_str(raw).map_err(|_| {
+            HarnessError::Protocol("OPENCODE_CONFIG_CONTENT must be a valid config object".into())
+        })?,
+        None => json!({}),
+    };
+    let object = config.as_object_mut().ok_or_else(|| {
+        HarnessError::Protocol("OPENCODE_CONFIG_CONTENT must be an object".into())
+    })?;
+    let servers = object.entry("mcp").or_insert_with(|| json!({}));
+    let servers = if protocol == Protocol::V2 {
+        servers
+            .as_object_mut()
+            .ok_or_else(|| {
+                HarnessError::Protocol("OPENCODE_CONFIG_CONTENT.mcp must be an object".into())
+            })?
+            .entry("servers")
+            .or_insert_with(|| json!({}))
+    } else {
+        servers
+    };
+    let servers = servers.as_object_mut().ok_or_else(|| {
+        HarnessError::Protocol("OPENCODE_CONFIG_CONTENT.mcp must be an object".into())
+    })?;
+    let command: Vec<&str> = std::iter::once(mcp.command.as_str())
+        .chain(mcp.args.iter().map(String::as_str))
+        .collect();
+    let mut server = json!({"type": "local", "command": command, "environment": mcp.env});
+    match protocol {
+        Protocol::V1 => server["enabled"] = json!(true),
+        Protocol::V2 => server["disabled"] = json!(false),
+    }
+    servers.insert(mcp.name.clone(), server);
+    Ok(config.to_string())
+}
+
+#[cfg(test)]
+mod mcp_injection_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mcp_injection_reaches_isolated_server_processes() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = tempfile::tempdir().unwrap();
+        for major in [1, 2] {
+            let exe = fixture.path().join(format!("opencode-{major}"));
+            let script = format!(
+                r#"#!/usr/bin/env node
+const http = require('node:http');
+const version = '{major}.0.0';
+if (process.argv.includes('--version')) {{ console.log(version); process.exit(0); }}
+const config = JSON.parse(process.env.OPENCODE_CONFIG_CONTENT);
+const server = {major} === 1 ? config.mcp.zeron : config.mcp.servers.zeron;
+if (!server || server.command[1] !== 'mcp') throw new Error('missing MCP config');
+const port = Number(process.argv[process.argv.indexOf('--port') + 1]);
+http.createServer((req, res) => {{
+  res.setHeader('content-type', 'application/json');
+  if (req.url === '/config-probe') {{ res.end(JSON.stringify(server)); return; }}
+  if (req.url === ({major} === 1 ? '/global/health' : '/api/info')) {{
+    res.end(JSON.stringify({{version}})); return;
+  }}
+  res.statusCode = 404; res.end('{{}}');
+}}).listen(port, '127.0.0.1');
+"#
+            );
+            std::fs::write(&exe, script).unwrap();
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let first = zeron_proto::McpServer {
+                name: "zeron".into(),
+                command: "/path with spaces/zeron".into(),
+                args: vec!["mcp".into()],
+                env: [("ZERON_CHAT_ID".into(), "first".into())].into(),
+            };
+            let mut second = first.clone();
+            second.env.insert("ZERON_CHAT_ID".into(), "second".into());
+            let mut a = Server::spawn(
+                &exe,
+                fixture.path().to_str(),
+                Duration::from_secs(5),
+                Some(&first),
+            )
+            .await
+            .unwrap();
+            let mut b = Server::spawn(
+                &exe,
+                fixture.path().to_str(),
+                Duration::from_secs(5),
+                Some(&second),
+            )
+            .await
+            .unwrap();
+            let a_config = a.get_json("/config-probe", None).await.unwrap();
+            let b_config = b.get_json("/config-probe", None).await.unwrap();
+            a.shutdown(Duration::from_millis(100)).await;
+            b.shutdown(Duration::from_millis(100)).await;
+            assert_eq!(a_config["environment"]["ZERON_CHAT_ID"], "first");
+            assert_eq!(b_config["environment"]["ZERON_CHAT_ID"], "second");
+            assert_eq!(
+                a_config["command"],
+                json!(["/path with spaces/zeron", "mcp"])
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_injection_preserves_config_and_scopes_identity_for_both_protocols() {
+        let mut mcp = zeron_proto::McpServer {
+            name: "zeron".into(),
+            command: "/path with spaces/zeron".into(),
+            args: vec!["mcp".into()],
+            env: [("ZERON_CHAT_ID".into(), "first".into())].into(),
+        };
+        for protocol in [Protocol::V1, Protocol::V2] {
+            let inherited = match protocol {
+                Protocol::V1 => {
+                    r#"{"model":"keep", "mcp":{"user":{"type":"remote","url":"https://example.test"}}}"#
+                }
+                Protocol::V2 => {
+                    r#"{"model":"keep", "mcp":{"servers":{"user":{"type":"remote","url":"https://example.test"}}}}"#
+                }
+            };
+            let first: Value =
+                serde_json::from_str(&mcp_config(Some(inherited), &mcp, protocol).unwrap())
+                    .unwrap();
+            mcp.env.insert("ZERON_CHAT_ID".into(), "second".into());
+            let second: Value =
+                serde_json::from_str(&mcp_config(Some(inherited), &mcp, protocol).unwrap())
+                    .unwrap();
+            assert_eq!(first["model"], "keep");
+            let pointer = if protocol == Protocol::V1 {
+                "/mcp"
+            } else {
+                "/mcp/servers"
+            };
+            let servers = first.pointer(pointer).unwrap();
+            assert_eq!(servers["user"]["url"], "https://example.test");
+            assert_eq!(
+                servers["zeron"]["command"],
+                json!(["/path with spaces/zeron", "mcp"])
+            );
+            assert_eq!(servers["zeron"]["environment"]["ZERON_CHAT_ID"], "first");
+            assert_eq!(
+                second.pointer(pointer).unwrap()["zeron"]["environment"]["ZERON_CHAT_ID"],
+                "second"
+            );
+            if protocol == Protocol::V1 {
+                assert_eq!(servers["zeron"]["enabled"], true);
+            } else {
+                assert_eq!(servers["zeron"]["disabled"], false);
+                assert!(servers["zeron"].get("enabled").is_none());
+            }
+            for invalid in ["[]", "{", r#"{"mcp":false}"#] {
+                assert!(mcp_config(Some(invalid), &mcp, protocol).is_err());
+            }
+            mcp.env.insert("ZERON_CHAT_ID".into(), "first".into());
+        }
     }
 }

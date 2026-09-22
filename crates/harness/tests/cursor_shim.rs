@@ -122,6 +122,19 @@ impl SessionFixture {
         tokio::process::ChildStdin,
         tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
     ) {
+        self.start_with_mcp(prompt, resume, serde_json::Value::Null)
+            .await
+    }
+    async fn start_with_mcp(
+        &self,
+        prompt: &str,
+        resume: bool,
+        mcp: serde_json::Value,
+    ) -> (
+        tokio::process::Child,
+        tokio::process::ChildStdin,
+        tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
+    ) {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
         let mut child = tokio::process::Command::new("node")
             .arg(self.dir.path().join("shim.mjs"))
@@ -134,7 +147,7 @@ impl SessionFixture {
             .unwrap();
         let mut stdin = child.stdin.take().unwrap();
         let lines = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
-        let frame = serde_json::json!({"op":"run","prompt":prompt,"cwd":self.dir.path(),"resume":resume.then_some("agent-fixture")});
+        let frame = serde_json::json!({"op":"run","prompt":prompt,"cwd":self.dir.path(),"resume":resume.then_some("agent-fixture"),"mcp":mcp});
         stdin
             .write_all(format!("{frame}\n").as_bytes())
             .await
@@ -476,5 +489,35 @@ async fn startup_catalog_rate_limit_retries_before_sending_but_auth_does_not() {
         let state: serde_json::Value =
             serde_json::from_slice(&std::fs::read(marker).unwrap()).unwrap();
         assert_eq!(state["attempts"], if succeeds { 2 } else { 1 });
+    }
+}
+
+#[tokio::test]
+async fn mcp_injection_reaches_sdk_on_create_and_resume_with_fresh_identity() {
+    let fixture = SessionFixture::new();
+    for (resume, chat) in [(false, "first"), (true, "second")] {
+        let (mut child, stdin, mut lines) = fixture
+            .start_with_mcp(
+                "normal",
+                resume,
+                serde_json::json!({
+                    "name": "zeron", "command": "/path with spaces/zeron", "args": ["mcp"],
+                    "env": {"ZERON_CHAT_ID": chat, "ZERON_IPC_PORT": "27699"},
+                }),
+            )
+            .await;
+        assert_eq!(frame(&mut lines).await["ev"], "ready");
+        assert_eq!(frame(&mut lines).await["ev"], "text");
+        assert_eq!(frame(&mut lines).await["status"], "finished");
+        finish(&mut child, stdin).await;
+        let options: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(fixture.dir.path().join("mcp-options.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(options["zeron"]["type"], "stdio");
+        assert_eq!(options["zeron"]["command"], "/path with spaces/zeron");
+        assert_eq!(options["zeron"]["args"], serde_json::json!(["mcp"]));
+        assert_eq!(options["zeron"]["env"]["ZERON_CHAT_ID"], chat);
+        assert_eq!(options["zeron"]["env"]["ZERON_IPC_PORT"], "27699");
     }
 }
