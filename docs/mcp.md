@@ -127,6 +127,21 @@ creates a held queue row. `awaitingInput` refuses and points at
 `respond_to_input`. Quiet, long-running turns still receive steering; the host
 falls back to starting a turn if the live runtime has already exited.
 
+Claude uses `priority: "next"` and confirms consumption through replayed user
+messages. Cursor uses the SDK's native `Run.steer`, waits for active tools to
+finish, and retains input until its delivery acknowledgment. These are mid-turn
+paths; they do not terminate the harness process. Adapters that only accept input
+between turns are labeled **Send next** in the composer.
+
+The opt-in `steering_live` engine test checks a rapid burst, foreground and
+background process survival, retained context, exactly-once effects, and ordered
+normal queue delivery. For Claude, Cursor and Codex it additionally requires the
+burst to finish within the original turn. Set `ZERON_TEST_BURST=6` to reproduce a
+six-message burst; select an inexpensive model with `ZERON_TEST_MODEL` and the
+harness with `ZERON_TEST_HARNESS`. Codex is checked for child survival during
+the active tool: its runtime cleans up background jobs on normal tool completion
+even without steering. Other providers also check a job that outlives that tool.
+
 `wait_for_turn` after a send is edge-triggered on the `Session` row captured
 before the send: it returns on a new `last_completed_turn`, an
 `awaitingInput`/`errored` stamp newer than the baseline, or a working→idle

@@ -918,6 +918,18 @@ impl Pickers {
             .is_some_and(|list| offered_harnesses(list).is_empty())
     }
 
+    pub(crate) fn steers_mid_turn(&self, cx: &App) -> bool {
+        self.harnesses
+            .ready()
+            .and_then(|list| {
+                let selected = self.effective_harness(cx)?;
+                list.iter().find(|h| h.id == selected)
+            })
+            .is_some_and(|h| {
+                h.supports_steering && h.steering_mode == zeron_proto::SteeringMode::StepBoundary
+            })
+    }
+
     /// The fully-resolved config the composer threads into the Run request and
     /// `Mutate createChat`: concrete model + reasoning whenever the catalog is
     /// loaded (no "engine picks a default" passthrough).

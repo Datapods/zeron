@@ -176,6 +176,7 @@ impl ClaudeHarness {
             // Required by the CLI alongside `-p --output-format stream-json`.
             "--verbose",
             "--include-partial-messages",
+            "--replay-user-messages",
             // Newer Claude models emit no readable thinking text unless a
             // summary is asked for (raw reasoning stays provider-private).
             "--thinking-display",
@@ -746,6 +747,7 @@ async fn run_session(session: Session) {
     let request_input = Arc::new(request_input);
 
     let mut norm = Normalizer::new();
+    let mut pending_steers = std::collections::VecDeque::new();
     let mut steering_open = true;
     let mut interrupted = false;
     let mut interrupt_sent = false;
@@ -779,6 +781,17 @@ async fn run_session(session: Session) {
                         }
                         continue;
                     }
+                    // Only the CLI's replay confirms that a prompt joined its
+                    // conversation. Writing stdin must not split ongoing text.
+                    if let Frame::User(ref user) = frame {
+                        if user.parent_tool_use_id.is_none() && user.uuid.as_ref().is_some_and(|id| pending_steers.front() == Some(id)) {
+                            pending_steers.pop_front();
+                            let (prev, next) = norm.rotate_for_steer();
+                            if event_tx.send(Ok(AgentEvent::Steered {
+                                assistant_message_id: Some(prev), next_assistant_message_id: Some(next),
+                            })).await.is_err() { break 'main; }
+                        }
+                    }
                     for ev in norm.normalize(frame, interrupted) {
                         let is_done = matches!(ev, AgentEvent::Done { .. });
                         if event_tx.send(Ok(ev)).await.is_err() {
@@ -802,19 +815,10 @@ async fn run_session(session: Session) {
 
             steer = steering.recv(), if steering_open && !interrupted => match steer {
                 Some(msg) => {
-                    let line = wire::user_message_line(&apply_ultrathink(reasoning, &msg.prompt));
-                    let _ = stdin_tx.send(StdinMsg::Line(line));
-                    // The CLI consumes the queued line at its own step
-                    // boundary; rotate the assistant message id so post-steer
-                    // output folds into a fresh message.
-                    let (prev, next) = norm.rotate_for_steer();
-                    let ev = AgentEvent::Steered {
-                        assistant_message_id: Some(prev),
-                        next_assistant_message_id: Some(next),
-                    };
-                    if event_tx.send(Ok(ev)).await.is_err() {
-                        break 'main;
-                    }
+                    let id = uuid::Uuid::new_v4().to_string();
+                    let line = wire::steer_message_line(&apply_ultrathink(reasoning, &msg.prompt), &id);
+                    pending_steers.push_back(id);
+                    if stdin_tx.send(StdinMsg::Line(line)).is_err() { break 'main; }
                 }
                 None => {
                     // Mailbox closed: end the input so the run can finish

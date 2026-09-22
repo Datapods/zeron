@@ -521,3 +521,122 @@ async fn mcp_injection_reaches_sdk_on_create_and_resume_with_fresh_identity() {
         assert_eq!(options["zeron"]["env"]["ZERON_IPC_PORT"], "27699");
     }
 }
+
+#[tokio::test]
+async fn rapid_steers_are_acknowledged_inside_the_active_sdk_run() {
+    use tokio::io::AsyncWriteExt;
+    let fixture = SessionFixture::new();
+    let (mut child, mut stdin, mut lines) = fixture.start("native-steer", false).await;
+    while frame(&mut lines).await["ev"] != "text" {}
+    for i in 0..3 {
+        stdin
+            .write_all(format!("{{\"op\":\"steer\",\"prompt\":\"message-{i}\"}}\n").as_bytes())
+            .await
+            .unwrap();
+    }
+    let mut acknowledgments = 0;
+    let mut messages = Vec::new();
+    loop {
+        let event = frame(&mut lines).await;
+        match event["ev"].as_str().unwrap() {
+            "steered" => acknowledgments += 1,
+            "text" => messages.push(event["text"].as_str().unwrap().to_owned()),
+            "turn" => {
+                assert_eq!(event["status"], "finished");
+                break;
+            }
+            other => panic!("unexpected frame {other}: {event}"),
+        }
+    }
+    assert_eq!(
+        acknowledgments, 3,
+        "all steers must enter before the active turn ends"
+    );
+    assert_eq!(
+        messages,
+        ["NATIVE:message-0", "NATIVE:message-1", "NATIVE:message-2"]
+    );
+    finish(&mut child, stdin).await;
+}
+
+#[tokio::test]
+async fn acknowledged_native_steer_survives_a_crash_before_checkpoint() {
+    use tokio::io::AsyncWriteExt;
+    let fixture = SessionFixture::new();
+    let (mut child, mut stdin, mut lines) = fixture.start("native-steer", false).await;
+    while frame(&mut lines).await["ev"] != "text" {}
+    stdin
+        .write_all(b"{\"op\":\"steer\",\"prompt\":\"uncheckpointed-steer-important\"}\n")
+        .await
+        .unwrap();
+    while frame(&mut lines).await["ev"] != "steered" {}
+    child.kill().await.unwrap();
+    drop(stdin);
+    let (mut child, stdin, mut lines) = fixture.start("normal", true).await;
+    while frame(&mut lines).await["ev"] != "turn" {}
+    finish(&mut child, stdin).await;
+    let store =
+        std::fs::read_to_string(fixture.dir.path().join("state/by-agent/agent-fixture")).unwrap();
+    let prompts =
+        std::fs::read_to_string(std::path::Path::new(store.trim()).join("prompts.ndjson")).unwrap();
+    let last: String = serde_json::from_str(prompts.lines().last().unwrap()).unwrap();
+    assert!(
+        last.contains("uncheckpointed-steer-important"),
+        "acknowledged steering was lost before its checkpoint"
+    );
+    assert!(last.contains("currentUserMessage\":\"normal"));
+}
+
+#[tokio::test]
+async fn turn_end_race_coalesces_all_reverted_inputs_and_announces_boundary_before_text() {
+    use tokio::io::AsyncWriteExt;
+    let fixture = SessionFixture::new();
+    let (mut child, mut stdin, mut lines) = fixture.start("native-revert", false).await;
+    while frame(&mut lines).await["ev"] != "text" {}
+    let batch = (0..3)
+        .map(|i| format!("{{\"op\":\"steer\",\"prompt\":\"raced-{i}\"}}\n"))
+        .collect::<String>();
+    stdin.write_all(batch.as_bytes()).await.unwrap();
+    assert_eq!(frame(&mut lines).await["ev"], "turn");
+    for _ in 0..3 {
+        assert_eq!(frame(&mut lines).await["ev"], "steered");
+    }
+    assert_eq!(frame(&mut lines).await["ev"], "text");
+    assert_eq!(frame(&mut lines).await["status"], "finished");
+    finish(&mut child, stdin).await;
+    let store =
+        std::fs::read_to_string(fixture.dir.path().join("state/by-agent/agent-fixture")).unwrap();
+    let prompts =
+        std::fs::read_to_string(std::path::Path::new(store.trim()).join("prompts.ndjson")).unwrap();
+    assert_eq!(
+        prompts.lines().count(),
+        2,
+        "a boundary race must not produce one turn per message"
+    );
+    for i in 0..3 {
+        assert!(
+            prompts
+                .lines()
+                .last()
+                .unwrap()
+                .contains(&format!("raced-{i}"))
+        );
+    }
+}
+
+#[tokio::test]
+async fn native_steering_waits_for_tool_completion_but_not_turn_completion() {
+    use tokio::io::AsyncWriteExt;
+    let fixture = SessionFixture::new();
+    let (mut child, mut stdin, mut lines) = fixture.start("native-tool", false).await;
+    while frame(&mut lines).await["phase"] != "start" {}
+    stdin
+        .write_all(b"{\"op\":\"steer\",\"prompt\":\"keep-child-alive\"}\n")
+        .await
+        .unwrap();
+    assert_eq!(frame(&mut lines).await["phase"], "end");
+    assert_eq!(frame(&mut lines).await["text"], "NATIVE:keep-child-alive");
+    assert_eq!(frame(&mut lines).await["ev"], "steered");
+    assert_eq!(frame(&mut lines).await["status"], "finished");
+    finish(&mut child, stdin).await;
+}

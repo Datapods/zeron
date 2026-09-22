@@ -14,6 +14,7 @@ use zeron_proto::{AgentEvent, DoneStatus, RunRequest, SandboxLevel};
 async fn main() -> anyhow::Result<()> {
     let name = std::env::args().nth(1).expect("harness name");
     let model = std::env::args().nth(2);
+    let require_mid_turn = std::env::args().any(|arg| arg == "--require-mid-turn");
     let harness: Arc<dyn Harness> = match name.as_str() {
         "claude" => Arc::new(ClaudeHarness::new()),
         "codex" => Arc::new(CodexHarness::new()),
@@ -88,6 +89,9 @@ async fn main() -> anyhow::Result<()> {
                         AgentEvent::Done { status, error, .. } => {
                             anyhow::ensure!(status == DoneStatus::Completed, "turn failed: {status:?} {error:?}");
                             done += 1;
+                            if require_mid_turn && done == 1 {
+                                anyhow::ensure!(injected && boundaries == 3 && (0..3).all(|i| workspace.path().join(format!("followup-{i}")).exists()), "steers were queued instead of handled by the active turn ({boundaries} confirmations)");
+                            }
                             if injected && (0..3).all(|i| workspace.path().join(format!("followup-{i}")).exists()) { break; }
                         }
                         AgentEvent::Error { message } => eprintln!("{name}: {message}"),

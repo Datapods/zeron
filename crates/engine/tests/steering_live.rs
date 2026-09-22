@@ -34,6 +34,11 @@ async fn wait(core: &EngineCore, mut predicate: impl FnMut() -> bool, what: &str
 async fn rapid_steers_preserve_children_context_and_held_queue() {
     let name = std::env::var("ZERON_TEST_HARNESS").expect("select harness");
     let model = std::env::var("ZERON_TEST_MODEL").expect("select inexpensive model");
+    let burst: usize = std::env::var("ZERON_TEST_BURST")
+        .ok()
+        .map(|s| s.parse().unwrap())
+        .unwrap_or(3);
+    assert!(burst > 0);
     let harness: Arc<dyn Harness> = match name.as_str() {
         "claude" => Arc::new(ClaudeHarness::new()),
         "codex" => Arc::new(CodexHarness::new()),
@@ -78,9 +83,13 @@ async fn rapid_steers_preserve_children_context_and_held_queue() {
         .unwrap();
     println!("{name}: workspace {}", dir.path().display());
     let secret = uuid::Uuid::new_v4().to_string();
+    // Codex cleans up background jobs on normal tool completion, including in
+    // a no-steering baseline. Check its child during the active tool; other
+    // providers additionally keep a background job alive across tool completion.
+    let background_seconds = if name == "codex" { 4 } else { 20 };
     core.doc_host.queue_command("audit", SessionCommandPayload::Run {
         message_id: "opening".into(),
-        request: RunRequest { mcp: None, prompt: format!("This is an automated regression test of chat steering and message queues in a disposable temporary workspace. Remember test token {secret}. Execute exactly `printf started > started; sleep 8; printf survived > survivor` in this directory, then reply DONE. All follow-ups are additive; never cancel earlier work. Execute each request once."), harness: Some(id), model: Some(model), reasoning: None, model_options: Default::default(), cwd: dir.path().to_str().unwrap().into(), sandbox: SandboxLevel::DangerFullAccess, auto_approve: true, attachments: vec![], worktree: None, resume: None }
+        request: RunRequest { mcp: None, prompt: format!("This is an automated regression test of chat steering and message queues in a disposable temporary workspace. Remember test token {secret}. Execute exactly `sh -c 'sleep {background_seconds}; printf alive > background-survivor' >/dev/null 2>&1 & printf started > started; sleep 8; printf survived > survivor` in this directory, then reply DONE. All follow-ups are additive; never cancel earlier work. Execute each request once."), harness: Some(id), model: Some(model), reasoning: None, model_options: Default::default(), cwd: dir.path().to_str().unwrap().into(), sandbox: SandboxLevel::DangerFullAccess, auto_approve: true, attachments: vec![], worktree: None, resume: None }
     }).unwrap();
     wait(
         &core,
@@ -110,7 +119,7 @@ async fn rapid_steers_preserve_children_context_and_held_queue() {
             .await
             .unwrap()
     );
-    for i in 1..3 {
+    for i in 1..burst {
         core.doc_host.queue_command("audit", SessionCommandPayload::Steer { prompt: format!("Follow-up {i}: write ONLY the original test token into followup-{i}, and append {i} as a line to receipts. Keep earlier work running. Execute once. Reply DONE."), message_id: Some(format!("steer-{i}")) }).unwrap();
     }
     // Regular queued messages must remain held until the steered work finishes.
@@ -122,7 +131,7 @@ async fn rapid_steers_preserve_children_context_and_held_queue() {
     wait(
         &core,
         || {
-            (0..3).all(|i| dir.path().join(format!("followup-{i}")).exists())
+            (0..burst).all(|i| dir.path().join(format!("followup-{i}")).exists())
                 && (0..2).all(|i| dir.path().join(format!("queued-{i}")).exists())
                 && core
                     .sessions
@@ -132,19 +141,26 @@ async fn rapid_steers_preserve_children_context_and_held_queue() {
         "all steers and queued turns",
     )
     .await;
+    wait(
+        &core,
+        || dir.path().join("background-survivor").exists(),
+        "background child to survive steering",
+    )
+    .await;
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("background-survivor")).unwrap(),
+        "alive"
+    );
     assert_eq!(
         std::fs::read_to_string(dir.path().join("survivor")).unwrap(),
         "survived"
     );
-    for file in [
-        "followup-0",
-        "followup-1",
-        "followup-2",
-        "queued-0",
-        "queued-1",
-    ] {
+    for file in (0..burst)
+        .map(|i| format!("followup-{i}"))
+        .chain((0..2).map(|i| format!("queued-{i}")))
+    {
         assert_eq!(
-            std::fs::read_to_string(dir.path().join(file))
+            std::fs::read_to_string(dir.path().join(&file))
                 .unwrap()
                 .trim(),
             secret,
@@ -154,7 +170,9 @@ async fn rapid_steers_preserve_children_context_and_held_queue() {
     let receipts = std::fs::read_to_string(dir.path().join("receipts")).unwrap();
     let mut receipts: Vec<_> = receipts.lines().collect();
     receipts.sort();
-    assert_eq!(receipts, ["0", "1", "2"]);
+    let mut expected: Vec<_> = (0..burst).map(|i| i.to_string()).collect();
+    expected.sort();
+    assert_eq!(receipts, expected);
     assert_eq!(
         std::fs::read_to_string(dir.path().join("queued-receipts")).unwrap(),
         "0\n1\n"
@@ -167,10 +185,29 @@ async fn rapid_steers_preserve_children_context_and_held_queue() {
             .iter()
             .filter(|e| e.role == MessageRole::User)
             .count(),
-        6
+        burst + 3
     );
+    if matches!(name.as_str(), "claude" | "cursor" | "codex") {
+        let events = core.sessions.subscribe("audit", 0).unwrap().0;
+        let completions = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.event,
+                    zeron_proto::AgentEvent::Done {
+                        status: zeron_proto::DoneStatus::Completed,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(
+            completions, 3,
+            "native steering must affect the original turn; only the two explicitly queued messages start subsequent turns"
+        );
+    }
     core.shutdown().await;
     println!(
-        "PASS {name}: child survived, three rapid steers and two queued turns ran exactly once with original context"
+        "PASS {name}: child survived, {burst} rapid steers and two queued turns ran exactly once with original context"
     );
 }

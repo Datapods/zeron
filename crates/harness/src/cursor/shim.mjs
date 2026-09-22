@@ -12,10 +12,12 @@
 // Protocol: JSONL, one frame per line.
 //   stdin  (engine → shim):
 //     {"op":"run","prompt","cwd","model"?,"modelOptions"?,"resume"?}   start / first turn
-//     {"op":"user","prompt"}                            next turn (parked)
+//     {"op":"user","prompt"}                            explicit next turn
+//     {"op":"steer","prompt"}                           native mid-turn input
 //     {"op":"interrupt"}                                cancel the live run
 //   stdout (shim → engine):
 //     {"ev":"ready","agentId","model"?}
+//     {"ev":"steered"}                                   input consumed
 //     {"ev":"text","text","parent"?}        parent = spawning task callId
 //     {"ev":"thinking","text","parent"?}
 //     {"ev":"tool","phase":"start"|"end","id","name","args"?,"error"?,"parent"?}
@@ -233,6 +235,10 @@ async function preserveInterruptedContext(prompt) {
       throw new Error("Cursor interrupted-message receipt is invalid; refusing to lose conversation context");
     }
     if (!saved.slice(previous.beforeUserCount).includes(previous.wirePrompt)) missing = previous.messages;
+    for (const steer of previous.nativeSteers ?? []) {
+      if (typeof steer.text !== "string" || !Number.isSafeInteger(steer.occurrence)) throw new Error("Invalid native steering receipt");
+      if (saved.filter(text => text === steer.text).length < steer.occurrence) missing.push(steer.text);
+    }
   }
   const wirePrompt = missing.length ?
     "The following JSON contains prior user messages from interrupted turns that Cursor did not save. " +
@@ -244,6 +250,27 @@ async function preserveInterruptedContext(prompt) {
     beforeUserCount: saved.length, wirePrompt, messages: [...missing, prompt]}), {mode: 0o600});
   fs.renameSync(temporary, receiptPath);
   return wirePrompt;
+}
+
+// Native acknowledgments can precede the next saved checkpoint. Retain the
+// acknowledged text across a crash or immediate stop, just like the main input.
+async function recordNativeSteer(text) {
+  if (!receiptPath) return () => {};
+  const saved = await savedUserMessages();
+  const receipt = JSON.parse(fs.readFileSync(receiptPath, "utf8"));
+  const entries = receipt.nativeSteers ?? [];
+  const occurrence = Math.max(saved.filter(value => value === text).length,
+    ...entries.filter(entry => entry.text === text).map(entry => entry.occurrence), 0) + 1;
+  const entry = {text, occurrence};
+  entries.push(entry);
+  receipt.nativeSteers = entries;
+  const persist = () => {
+    const temporary = `${receiptPath}.tmp-${process.pid}`;
+    fs.writeFileSync(temporary, JSON.stringify(receipt), {mode: 0o600});
+    fs.renameSync(temporary, receiptPath);
+  };
+  persist();
+  return () => { receipt.nativeSteers = entries.filter(value => value !== entry); persist(); };
 }
 
 // ---- models mode ----------------------------------------------------------
@@ -329,6 +356,7 @@ setInterval(() => {
 // One InteractionUpdate → zero or one frame. `parent` attributes nested
 // subagent traffic (tool-call-delta carries the child's updates tagged by
 // the spawning task's callId — the full subagent transcript, live).
+const activeTools = new Set();
 function mapUpdate(u, parent) {
   if (!u || typeof u !== "object") return;
   const tag = parent ? { parent } : {};
@@ -340,6 +368,7 @@ function mapUpdate(u, parent) {
       if (u.text) out({ ev: "thinking", text: u.text, ...tag });
       break;
     case "tool-call-started":
+      if (!parent) activeTools.add(u.callId);
       out({
         ev: "tool",
         phase: "start",
@@ -350,6 +379,10 @@ function mapUpdate(u, parent) {
       });
       break;
     case "tool-call-completed": {
+      if (!parent) {
+        activeTools.delete(u.callId);
+        queueMicrotask(() => { void pumpSteers().catch(fatal); });
+      }
       const r = u.toolCall?.result;
       const failed =
         r?.status === "error" ||
@@ -402,7 +435,57 @@ function withAuthHint(message) {
   return text;
 }
 
-async function runTurn(prompt, ready) {
+// Keep ownership until Cursor confirms that the active turn appended the text.
+// A boundary race returns revert_to_followup; only those messages start a turn.
+const pendingSteers = [];
+let steerPump = null;
+let turnActive = false;
+function pumpSteers() {
+  if (steerPump) return steerPump;
+  if (!run || !pendingSteers.length || activeTools.size) return Promise.resolve();
+  const target = run;
+  steerPump = (async () => {
+    while (pendingSteers.length && run === target && !activeTools.size && !interrupted && !closing) {
+      if (typeof target.steer !== "function") {
+        throw new Error("Cursor SDK lacks native steering; update the managed SDK");
+      }
+      const message = pendingSteers[0];
+      if (message.revertedRun === target) return;
+      const reverted = await recordNativeSteer(message.prompt);
+      // History lookup can yield while another tool starts. Never let native
+      // steering cancel its shell/process tree; inject at the tool boundary.
+      if (activeTools.size) { reverted(); return; }
+      const outcome = await target.steer(message.prompt);
+      if (outcome === "revert_to_followup") { message.revertedRun = target; reverted(); return; }
+      if (outcome !== "complete_delivered") throw new Error(`Unknown Cursor steering acknowledgment: ${outcome}`);
+      pendingSteers.shift();
+      out({ev: "steered"});
+    }
+  })().finally(() => { steerPump = null; });
+  return steerPump;
+}
+async function followupSteers() {
+  while (pendingSteers.length && !interrupted && !closing) {
+    const batch = pendingSteers.splice(0);
+    const prompt = batch.length === 1 ? batch[0].prompt :
+      "These user messages arrived together. Address them together in order:\n" +
+      JSON.stringify(batch.map(message => message.prompt));
+    await runTurn(prompt, undefined, () => {
+      for (const message of batch) out({ev: "steered"});
+    });
+  }
+}
+function acceptSteer(message) {
+  pendingSteers.push(message);
+  if (turnActive) {
+    void pumpSteers().catch(fatal);
+  } else {
+    chain = chain.then(followupSteers).catch(fatal);
+  }
+}
+
+async function runTurn(prompt, ready, accepted) {
+  turnActive = true;
   if (closing) return;
   try {
     prompt = await preserveInterruptedContext(prompt);
@@ -411,6 +494,7 @@ async function runTurn(prompt, ready) {
       out({ev: "turn", status: "cancelled"});
       return;
     }
+    accepted?.();
     run = await agent.send(prompt, {
       onDelta: ({ update }) => {
         try {
@@ -423,8 +507,10 @@ async function runTurn(prompt, ready) {
   } catch (e) {
     out({ ev: "turn", status: "error", error: withAuthHint(formatError(e, run?.requestId)) });
     run = null;
+    turnActive = false;
     return;
   }
+  void pumpSteers().catch(fatal);
   // Interrupt may arrive while send() is still creating the run.
   if (interrupted || closing) await run.cancel().catch(() => {});
   let result;
@@ -438,12 +524,16 @@ async function runTurn(prompt, ready) {
     });
     return;
   }
+  activeTools.clear();
+  await pumpSteers();
   run = null;
+  turnActive = false;
   out({
     ev: "turn",
     status: result?.status ?? "finished",
     ...(result?.error?.message ? { error: withAuthHint(formatError(result.error, result.requestId)) } : {}),
   });
+  if (pendingSteers.length) chain = chain.then(followupSteers).catch(fatal);
 }
 
 // The run's ModelSelection: id + typed parameter values (thinking / context /
@@ -548,6 +638,9 @@ rl.on("line", (line) => {
   switch (msg.op) {
     case "run":
       chain = chain.then(() => start(msg)).catch((e) => fatal(e));
+      break;
+    case "steer":
+      acceptSteer(msg);
       break;
     case "user":
       chain = chain

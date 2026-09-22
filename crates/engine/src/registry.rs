@@ -471,13 +471,13 @@ pub fn default_registry() -> HarnessRegistry {
     );
     // Cursor via the pinned @cursor/sdk shim (NOT ACP — that surface strips
     // subagent transcripts), same lazy pattern: the static descriptor mirrors
-    // CursorHarness exactly. Turn-boundary steering; no effort ladder.
+    // CursorHarness exactly. Native step-boundary steering; no effort ladder.
     registry.register_lazy(
         HarnessDescriptor {
             id: HarnessId::Cursor,
             name: "Cursor".into(),
             supports_steering: true,
-            steering_mode: SteeringMode::TurnBoundary,
+            steering_mode: SteeringMode::StepBoundary,
             reasoning_levels: Vec::new(),
             installed: true,
             can_install: false,
@@ -720,7 +720,7 @@ mod tests {
         let cursor = registry.resolve(HarnessId::Cursor).unwrap();
         assert_eq!(cursor.id(), HarnessId::Cursor);
         assert_eq!(cursor.display_name(), "Cursor");
-        assert_eq!(cursor.steering_mode(), SteeringMode::TurnBoundary);
+        assert_eq!(cursor.steering_mode(), SteeringMode::StepBoundary);
         assert!(cursor.reasoning_levels().is_empty());
         let devin = registry.resolve(HarnessId::Devin).unwrap();
         assert_eq!(devin.id(), HarnessId::Devin);

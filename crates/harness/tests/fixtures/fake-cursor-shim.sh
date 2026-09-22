@@ -63,7 +63,8 @@ case "$first" in
   # Parked: wait for a follow-up or stdin EOF.
   read -r next || exit 0
   case "$next" in
-  *'"op":"user"'*)
+  *'"op":"steer"'*)
+    emit '{"ev":"steered"}'
     emit '{"ev":"text","text":"second turn"}'
     emit '{"ev":"turn","status":"finished"}'
     ;;

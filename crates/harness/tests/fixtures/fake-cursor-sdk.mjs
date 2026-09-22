@@ -53,7 +53,27 @@ function instance(store) {
         await store.agents.update({agent:{...doc,status:'idle',activeRunId:null}});
         resolve({status});
       };
+      let toolFinished = prompt !== 'native-tool';
+      if (!toolFinished) {
+        onDelta({update:{type:'tool-call-started',callId:'active-shell',toolCall:{type:'shell'}}});
+        setTimeout(() => {
+          toolFinished = true;
+          onDelta({update:{type:'tool-call-completed',callId:'active-shell',toolCall:{type:'shell'}}});
+        },80);
+      }
+      let steerTimer;
       return {id:runId,
+        async steer(text){
+          if(prompt === 'native-revert') {await finish('finished'); return 'revert_to_followup';}
+          if (!toolFinished) throw new Error('steering killed the active shell');
+          if(!['native-steer','native-tool'].includes(prompt)) return 'revert_to_followup';
+          store.logPrompt(text);
+          onDelta({update:{type:'text-delta',text:'NATIVE:'+text}});
+          clearTimeout(steerTimer);
+          steerTimer=setTimeout(()=>finish('finished'),150);
+          await new Promise(resolve=>setTimeout(resolve,10));
+          return 'complete_delivered';
+        },
         async cancel(){if(prompt==='hung-cancel')return new Promise(()=>{});await finish('cancelled');},
         async wait(){
           if(prompt==='wait-error')throw new Error('stream disconnected');
@@ -67,7 +87,7 @@ function instance(store) {
             return pending;
           }
           if(prompt==='auth-error')return {status:'error',error:{message:'ERROR_NOT_LOGGED_IN'}};
-          if(['hang','hung-cancel'].includes(prompt))return pending;
+          if(['hang','hung-cancel','native-steer','native-revert','native-tool'].includes(prompt))return pending;
           await finish('finished');return {status:'finished'};
         },
       };
