@@ -249,15 +249,36 @@
   }
 
   /* ── supported by ─────────────────────────────────────── */
-  .supported { padding-top: 110px; position: relative; z-index: 1; }
+  .supported { padding-top: 64px; position: relative; z-index: 1; }
   .supported .wrap { display: flex; flex-direction: column; align-items: center; text-align: center; }
   .supported h2 {
-    font-size: clamp(24px, 3vw, 32px);
-    font-weight: 600;
-    letter-spacing: -0.025em;
+    font-size: 20px;
+    font-weight: 500;
+    letter-spacing: -0.02em;
   }
-  .supported-logo { display: inline-flex; margin: 30px 0 34px; }
-  .supported-logo img { width: auto; }
+  .sponsor { margin-top: 22px; display: flex; align-items: center; gap: 12px; text-align: left; }
+  .sponsor-mark {
+    display: grid;
+    place-items: center;
+    width: 40px;
+    height: 40px;
+    flex: 0 0 auto;
+    border-radius: 50%;
+    background: var(--bg-raise);
+    border: 1px solid var(--line);
+  }
+  .sponsor-name { font-size: 16px; font-weight: 500; color: var(--ink); transition: opacity .15s; }
+  .sponsor-name:hover { opacity: 0.7; }
+  .sponsor p { margin-top: 3px; font-size: 13px; color: var(--dim); }
+  .support-link {
+    margin-top: 22px;
+    font-size: 13px;
+    color: var(--faint);
+    text-decoration: underline;
+    text-underline-offset: 3px;
+    transition: color .15s;
+  }
+  .support-link:hover { color: var(--ink); }
 
   /* ── agents ──────────────────────────────────────────── */
   .agents {
@@ -789,8 +810,7 @@
     .agent-icon { width: 20px; height: 20px; }
     .shot { padding: 28px 0 0; }
     .shot img { border-radius: 4px; }
-    .supported { padding-top: 72px; }
-    .supported-logo img { height: 22px; }
+    .supported { padding-top: 48px; }
     .panel-sect { padding-top: 72px; }
     .reach-left, .reach-right { display: none; }
     .tweets { padding: 84px 0 0; }
@@ -924,8 +944,14 @@
   <section class="supported">
     <div class="wrap">
       <h2>Supported by</h2>
-      <a class="supported-logo" href="https://www.thecontextcompany.com" target="_blank" rel="noopener"><img src="/assets/logos/thecontextcompany.png" alt="The Context Company" height="28" /></a>
-      <a class="btn ghost" href="https://github.com/sponsors/zeronsh" target="_blank" rel="noopener">Support Zeron ↗</a>
+      <div class="sponsor">
+        <span class="sponsor-mark"><img src="/assets/logos/thecontextcompany-mark.svg" alt="" width="22" height="22" /></span>
+        <div>
+          <a class="sponsor-name" href="https://www.thecontextcompany.com" target="_blank" rel="noopener">The Context Company</a>
+          <p>Monitor and improve your AI agents</p>
+        </div>
+      </div>
+      <a class="support-link" href="https://github.com/sponsors/zeronsh" target="_blank" rel="noopener">Support the project ↗</a>
     </div>
   </section>
 
