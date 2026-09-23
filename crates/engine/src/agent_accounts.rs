@@ -73,8 +73,7 @@ const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const CURSOR_CURRENT_PERIOD_USAGE: &str = "aiserver.v1.DashboardService/GetCurrentPeriodUsage";
 const CURSOR_DEFAULT_BACKEND: &str = "https://api2.cursor.sh";
 
-#[cfg(target_os = "macos")]
-const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
+const CLAUDE_KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 
 /// Claude Code stores these next to `claudeAiOauth` in the same credential
 /// blob, but they are machine-shared (MCP server OAuth, plugin secrets) and
@@ -108,6 +107,13 @@ pub struct AgentAccountsConfig {
     /// named, expiring API key minted by its browser login. SEPARATE from
     /// `cursor-agent login`'s session tokens — deliberately never read.
     pub cursor_sdk_auth_file: PathBuf,
+    /// macOS Keychain service Claude Code keeps its login under:
+    /// `Claude Code-credentials`, or — with `CLAUDE_CONFIG_DIR` set — that
+    /// name suffixed with the first 8 hex of sha256(the raw env value).
+    pub claude_keychain_service: String,
+    /// Anthropic's OAuth profile endpoint — the ownership oracle for a live
+    /// Claude credential (explicit so tests never hit the network).
+    pub claude_profile_url: String,
 }
 
 impl AgentAccountsConfig {
@@ -124,12 +130,26 @@ impl AgentAccountsConfig {
             Some(dir) => dir.join(".claude.json"),
             None => home_dir().join(".claude.json"),
         };
+        // Claude Code hashes the raw env string (not a resolved path) into
+        // the Keychain service name of a relocated config dir.
+        let claude_keychain_service = match &claude_dir {
+            Some(dir) => {
+                let digest = Sha256::digest(dir.to_string_lossy().as_bytes());
+                format!(
+                    "{CLAUDE_KEYCHAIN_SERVICE}-{}",
+                    &crate::repos::hex(&digest)[..8]
+                )
+            }
+            None => CLAUDE_KEYCHAIN_SERVICE.to_string(),
+        };
         Self {
             data_dir: data_dir.to_path_buf(),
             claude_config_dir: claude_dir.unwrap_or_else(|| home_dir().join(".claude")),
             claude_config_file,
             codex_home: env_dir("CODEX_HOME").unwrap_or_else(|| home_dir().join(".codex")),
             cursor_sdk_auth_file: home_dir().join(".cursor").join("sdk").join("auth.json"),
+            claude_keychain_service,
+            claude_profile_url: CLAUDE_PROFILE_URL.to_string(),
         }
     }
 
@@ -266,6 +286,129 @@ struct Inner {
     /// Slots with a token refresh in flight — a second refresh of the same
     /// (commonly single-use) refresh token would revoke the family.
     inflight_refreshes: Mutex<std::collections::HashSet<String>>,
+    /// Serializes everything that reads the live logins and writes slots or
+    /// the live stores (live sync, switch, forget, login completion, slot
+    /// refresh). Without it a page-mount list could snapshot the half-written
+    /// state of a concurrent switch into the wrong slot.
+    ops: tokio::sync::Mutex<()>,
+    /// Refresh-token fingerprint → the Claude account the profile endpoint
+    /// said it belongs to. Positive verdicts only; one probe per rotation.
+    claude_owners: Mutex<HashMap<String, ClaudeIdentity>>,
+}
+
+/// Who a Claude credential belongs to, per Anthropic's profile endpoint.
+#[derive(Debug, Clone)]
+struct ClaudeIdentity {
+    uuid: String,
+    email: String,
+}
+
+/// Where a live Claude credential belongs (claude-swap's switch-time
+/// classifier, issue #117). The credentials store and `~/.claude.json` are
+/// written by different actors at different times — a still-running Claude
+/// Code session refreshes its OLD account and writes those tokens back after
+/// a switch — so the identity file alone never proves whose tokens these are.
+enum ClaudeOwnership {
+    /// The slot named by `~/.claude.json` — snapshot into it.
+    Own,
+    /// `~/.claude.json`'s slot holds a NEWER login (a re-sign-in) than the
+    /// live store's older family; keep the slot, don't downgrade it.
+    SlotNewer,
+    /// The tokens are another saved slot's lineage. `refresh` = they're a
+    /// rotation that slot hasn't seen yet (write them there).
+    Other { slot: Slot, refresh: bool },
+    /// Claude Code emptied the tokens after a rejected refresh (its
+    /// `invalid_grant` reaction) — nothing to save; never write over a slot.
+    Wiped,
+    /// No OAuth refresh token, an unmanaged account, or ownership unknown
+    /// (offline, expired access token) — leave every slot alone. `unsaved` =
+    /// a real login no slot backs up (a switch would destroy it).
+    Unknown { unsaved: bool },
+}
+
+/// Claude Code's own advisory locks, npm `proper-lockfile` style: the lock is
+/// a DIRECTORY (`mkdir` atomicity is the mutex) whose mtime a holder touches
+/// every 5s; one older than 60s is stale. Its token refresh holds
+/// `<config-dir>/.oauth_refresh.lock` then `<config-dir>.lock` across read →
+/// POST → save. Holding the same pair while switching means a refresh can't
+/// land the OLD account's rotated tokens over the switch, nor rotate the
+/// generation we're snapshotting; under the lock Claude Code's double-checked
+/// re-read sees the swapped login and adopts it instead of refreshing.
+struct ClaudeRefreshLock {
+    held: Vec<PathBuf>,
+}
+
+impl ClaudeRefreshLock {
+    const STALE: Duration = Duration::from_secs(60);
+    const WAIT: Duration = Duration::from_secs(10);
+
+    async fn acquire(config_dir: &Path) -> Result<Self, EngineError> {
+        let mut legacy = config_dir.as_os_str().to_owned();
+        legacy.push(".lock");
+        let mut lock = Self { held: Vec::new() };
+        for path in [
+            config_dir.join(".oauth_refresh.lock"),
+            PathBuf::from(legacy),
+        ] {
+            Self::acquire_one(&path).await?;
+            lock.held.push(path);
+        }
+        Ok(lock)
+    }
+
+    async fn acquire_one(path: &Path) -> Result<(), EngineError> {
+        let deadline = Instant::now() + Self::WAIT;
+        loop {
+            match std::fs::create_dir(path) {
+                Ok(()) => return Ok(()),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let stale = std::fs::metadata(path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|at| at.elapsed().ok())
+                        .is_some_and(|age| age > Self::STALE);
+                    if stale {
+                        let _ = std::fs::remove_dir(path);
+                        continue;
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    continue;
+                }
+                Err(err) => return Err(err.into()),
+            }
+            if Instant::now() >= deadline {
+                return Err(EngineError::Other(
+                    "Claude Code is refreshing its login right now — try again in a moment.".into(),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+}
+
+impl Drop for ClaudeRefreshLock {
+    fn drop(&mut self) {
+        for path in self.held.iter().rev() {
+            let _ = std::fs::remove_dir(path);
+        }
+    }
+}
+
+/// The live logins as one sync pass found them.
+#[derive(Default)]
+struct LiveState {
+    /// Harness → the account key the CLI is really signed in as.
+    active_keys: HashMap<HarnessId, String>,
+    /// Live logins we know exist but couldn't read the secret of.
+    unreadable: HashMap<HarnessId, Detected>,
+    /// Live logins present on disk that no slot backs up — a switch would
+    /// destroy them, so it's refused.
+    unsaved: std::collections::HashSet<HarnessId>,
+    warnings: Vec<AgentAccountWarning>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -302,53 +445,30 @@ impl AgentAccounts {
                 flows: Mutex::new(HashMap::new()),
                 usage_cache: Mutex::new(HashMap::new()),
                 inflight_refreshes: Mutex::new(std::collections::HashSet::new()),
+                ops: tokio::sync::Mutex::new(()),
+                claude_owners: Mutex::new(HashMap::new()),
             }),
         }
     }
 
     // ── list ────────────────────────────────────────────────────────────────
 
-    /// Detect both CLIs, auto-snapshot the live logins, and assemble the view.
+    /// Detect the CLIs' live logins, sync them into their slots, and assemble
+    /// the view.
     pub async fn list(&self, force_usage: bool) -> Result<AgentAccountsSnapshot, EngineError> {
         if force_usage {
             lock(&self.inner.usage_cache).clear();
         }
-        let mut warnings: Vec<AgentAccountWarning> = Vec::new();
-        let mut active_keys: HashMap<HarnessId, String> = HashMap::new();
-        let mut unreadable: HashMap<HarnessId, Detected> = HashMap::new();
-
-        let (claude, claude_warning) = self.detect_claude().await;
-        if let Some(message) = claude_warning {
-            warnings.push(AgentAccountWarning {
-                harness: HarnessId::ClaudeCode,
-                message,
-            });
-        }
-        if let Some(detected) = claude {
-            active_keys.insert(HarnessId::ClaudeCode, detected.account_key.clone());
-            if detected.credentials.is_some() {
-                self.snapshot_detected(HarnessId::ClaudeCode, &detected)?;
-            } else {
-                unreadable.insert(HarnessId::ClaudeCode, detected);
-            }
-        }
-        if let Some(detected) = self.detect_codex() {
-            active_keys.insert(HarnessId::Codex, detected.account_key.clone());
-            self.snapshot_detected(HarnessId::Codex, &detected)?;
-        }
-        if let Some(detected) = self.detect_cursor() {
-            active_keys.insert(HarnessId::Cursor, detected.account_key.clone());
-            self.snapshot_detected(HarnessId::Cursor, &detected)?;
-            // The SDK's minted keys expire (90-day default) — an expired live
-            // key fails every run with an auth error, so say so up front.
-            if !self.cursor_live_usable() {
-                warnings.push(AgentAccountWarning {
-                    harness: HarnessId::Cursor,
-                    message: "The connected Cursor login's API key has expired — connect again."
-                        .into(),
-                });
-            }
-        }
+        let live = {
+            let _ops = self.inner.ops.lock().await;
+            self.sync_live(None).await?
+        };
+        let LiveState {
+            active_keys,
+            unreadable,
+            warnings,
+            ..
+        } = live;
 
         // Stable presentation order: provider, then slot creation order (never
         // active-first — switching must not reshuffle the cards).
@@ -359,6 +479,7 @@ impl AgentAccounts {
             for slot in &slots {
                 let active = active_key.as_deref() == Some(slot.account_key.as_str());
                 let usage = self.usage_for(harness, slot, active, force_usage).await;
+                let (needs_login, login_expires_at) = slot_login_state(slot);
                 accounts.push(AgentAccount {
                     id: slot.id.clone(),
                     harness,
@@ -375,8 +496,10 @@ impl AgentAccounts {
                     display_name: slot.profile.display_name.clone(),
                     organization: slot.profile.organization.clone(),
                     auth_kind: Some(slot.profile.auth_kind),
-                    switchable: true,
+                    switchable: !needs_login,
                     saved_at: Some(slot.saved_at),
+                    login_expires_at,
+                    needs_login,
                 });
             }
             // A live login whose credentials we couldn't read has no slot — still
@@ -396,40 +519,321 @@ impl AgentAccounts {
                     auth_kind: Some(u.profile.auth_kind),
                     switchable: false,
                     saved_at: None,
+                    login_expires_at: None,
+                    needs_login: false,
                 });
             }
         }
         Ok(AgentAccountsSnapshot { accounts, warnings })
     }
 
+    /// Detect each CLI's live login and snapshot it into its slot — the
+    /// current session is always backed up before any swap, and refreshed
+    /// tokens stay current. `switching` names the harness whose live login is
+    /// about to be overwritten: for Claude an unverifiable rotation is then
+    /// saved anyway (fail-open — skipping would strand the only live copy),
+    /// where a plain list leaves the slot alone. Caller holds `ops`.
+    async fn sync_live(&self, switching: Option<HarnessId>) -> Result<LiveState, EngineError> {
+        let mut live = LiveState::default();
+        self.sync_claude(switching == Some(HarnessId::ClaudeCode), &mut live)
+            .await?;
+
+        self.migrate_codex_slot_keys()?;
+        match self.detect_codex() {
+            Some(detected) => {
+                live.active_keys
+                    .insert(HarnessId::Codex, detected.account_key.clone());
+                self.snapshot_detected(HarnessId::Codex, &detected)?;
+            }
+            // A login we can't parse is a login we can't back up.
+            None if codex_auth_holds_secret(&self.inner.config.codex_auth_file()) => {
+                live.unsaved.insert(HarnessId::Codex);
+                live.warnings.push(AgentAccountWarning {
+                    harness: HarnessId::Codex,
+                    message: "Codex's auth.json holds a login Zeron can't read, so it can't be \
+                              saved — switching is disabled until you sign in again."
+                        .into(),
+                });
+            }
+            None => {}
+        }
+
+        if let Some(detected) = self.detect_cursor() {
+            live.active_keys
+                .insert(HarnessId::Cursor, detected.account_key.clone());
+            self.snapshot_detected(HarnessId::Cursor, &detected)?;
+            // The SDK's minted keys expire (90-day default) — an expired live
+            // key fails every run with an auth error, so say so up front.
+            if !self.cursor_live_usable() {
+                live.warnings.push(AgentAccountWarning {
+                    harness: HarnessId::Cursor,
+                    message: "The connected Cursor login's API key has expired — connect again."
+                        .into(),
+                });
+            }
+        }
+        Ok(live)
+    }
+
+    /// The Claude half of [`Self::sync_live`]: snapshot the live credential
+    /// only into the slot it provably belongs to.
+    async fn sync_claude(&self, switching: bool, live: &mut LiveState) -> Result<(), EngineError> {
+        let (detected, warning) = self.detect_claude().await;
+        if let Some(message) = warning {
+            live.warnings.push(AgentAccountWarning {
+                harness: HarnessId::ClaudeCode,
+                message,
+            });
+        }
+        let Some(detected) = detected else {
+            return Ok(());
+        };
+        let Some(credentials) = detected.credentials.clone() else {
+            live.active_keys
+                .insert(HarnessId::ClaudeCode, detected.account_key.clone());
+            live.unreadable.insert(HarnessId::ClaudeCode, detected);
+            return Ok(());
+        };
+        let mut active_key = detected.account_key.clone();
+        match self
+            .claude_ownership(&detected, &credentials, switching)
+            .await
+        {
+            ClaudeOwnership::Own => self.snapshot_detected(HarnessId::ClaudeCode, &detected)?,
+            ClaudeOwnership::SlotNewer => {}
+            ClaudeOwnership::Other { slot, refresh } => {
+                if refresh {
+                    let mut updated = slot.clone();
+                    updated.credentials = credentials;
+                    updated.saved_at = now_ms();
+                    self.write_slot(&updated)?;
+                }
+                live.warnings.push(AgentAccountWarning {
+                    harness: HarnessId::ClaudeCode,
+                    message: format!(
+                        "Claude Code is signed in as {}, but ~/.claude.json names {} — \
+                         something outside Zeron changed the login. Switch accounts to \
+                         straighten it out.",
+                        slot.profile.email, detected.profile.email
+                    ),
+                });
+                active_key = slot.account_key;
+            }
+            ClaudeOwnership::Wiped => live.warnings.push(AgentAccountWarning {
+                harness: HarnessId::ClaudeCode,
+                message: format!(
+                    "Claude Code was signed out of {} — Anthropic rejected its login (logins \
+                     expire about a month after sign-in). Sign in again with Add account.",
+                    detected.profile.email
+                ),
+            }),
+            ClaudeOwnership::Unknown { unsaved } => {
+                if unsaved {
+                    live.unsaved.insert(HarnessId::ClaudeCode);
+                }
+            }
+        }
+        live.active_keys.insert(HarnessId::ClaudeCode, active_key);
+        Ok(())
+    }
+
+    /// Decide which slot (if any) the live Claude credential belongs to.
+    async fn claude_ownership(
+        &self,
+        detected: &Detected,
+        live: &serde_json::Value,
+        switching: bool,
+    ) -> ClaudeOwnership {
+        let Some(oauth) = live.get("claudeAiOauth") else {
+            // No OAuth login in the store (API-key mode, MCP-only blob):
+            // nothing of the slot's to capture, and writing it would erase
+            // the slot's own tokens (claude-swap #383).
+            return ClaudeOwnership::Unknown { unsaved: false };
+        };
+        let Some(live_refresh) = str_field(oauth, "refreshToken") else {
+            return if str_field(oauth, "accessToken").is_none() {
+                ClaudeOwnership::Wiped
+            } else {
+                ClaudeOwnership::Unknown { unsaved: false }
+            };
+        };
+        let slots = self.read_slots(HarnessId::ClaudeCode);
+        let own = slots.iter().find(|s| s.account_key == detected.account_key);
+        if own.is_some_and(|s| claude_refresh_token(&s.credentials).as_ref() == Some(&live_refresh))
+        {
+            return ClaudeOwnership::Own;
+        }
+        if let Some(other) = slots.iter().find(|s| {
+            s.account_key != detected.account_key
+                && claude_refresh_token(&s.credentials).as_ref() == Some(&live_refresh)
+        }) {
+            return ClaudeOwnership::Other {
+                slot: other.clone(),
+                refresh: false,
+            };
+        }
+        // A lineage no slot holds: a routine rotation, a fresh login — or a
+        // still-running session writing ANOTHER account's refreshed tokens
+        // back after a switch. Only the token itself can say which.
+        let own_or_newer = || match own {
+            Some(slot) if claude_login_newer(&slot.credentials, oauth) => {
+                ClaudeOwnership::SlotNewer
+            }
+            _ => ClaudeOwnership::Own,
+        };
+        match self.claude_token_owner(oauth, &live_refresh).await {
+            Some(owner)
+                if owner.uuid == detected.account_key
+                    || (detected.account_key == detected.profile.email
+                        && owner.email == detected.profile.email) =>
+            {
+                own_or_newer()
+            }
+            Some(owner) => match slots.iter().find(|s| s.account_key == owner.uuid) {
+                Some(slot) => ClaudeOwnership::Other {
+                    slot: slot.clone(),
+                    refresh: !claude_login_newer(&slot.credentials, oauth),
+                },
+                // An account no slot knows: never file it under the wrong
+                // name, and don't let a switch destroy it either.
+                None => ClaudeOwnership::Unknown { unsaved: true },
+            },
+            // Unverifiable. A first sighting has nothing to overwrite, and a
+            // switch must not strand the only live copy — otherwise wait for
+            // a pass that can verify.
+            None if own.is_none() || switching => own_or_newer(),
+            None => ClaudeOwnership::Unknown { unsaved: false },
+        }
+    }
+
+    /// Ask Anthropic whose token this is (cached per refresh-token lineage).
+    /// `None` = couldn't tell: offline, expired access token, endpoint error.
+    async fn claude_token_owner(
+        &self,
+        oauth: &serde_json::Value,
+        refresh_token: &str,
+    ) -> Option<ClaudeIdentity> {
+        let key = token_fingerprint(refresh_token);
+        if let Some(owner) = lock(&self.inner.claude_owners).get(&key) {
+            return Some(owner.clone());
+        }
+        let access_token = str_field(oauth, "accessToken")?;
+        if oauth
+            .get("expiresAt")
+            .and_then(|v| v.as_i64())
+            .is_some_and(|at| at <= now_ms() + 60_000)
+        {
+            return None;
+        }
+        let profile: serde_json::Value = self
+            .inner
+            .http
+            .get(&self.inner.config.claude_profile_url)
+            .bearer_auth(&access_token)
+            .header("anthropic-beta", "oauth-2025-04-20")
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        let account = profile.get("account")?;
+        let owner = ClaudeIdentity {
+            uuid: str_field(account, "uuid")?,
+            email: str_field(account, "email_address").unwrap_or_default(),
+        };
+        lock(&self.inner.claude_owners).insert(key, owner.clone());
+        Some(owner)
+    }
+
+    /// Codex slots used to be keyed by `chatgpt_account_id` alone — which
+    /// every seat of a ChatGPT Team workspace shares, so teammates' logins
+    /// collapsed into one slot and overwrote each other. Re-key such slots by
+    /// user + workspace (see [`parse_codex_auth`]). Caller holds `ops`.
+    fn migrate_codex_slot_keys(&self) -> Result<(), EngineError> {
+        for slot in self.read_slots(HarnessId::Codex) {
+            let Some(detected) = parse_codex_auth(slot.credentials.clone()) else {
+                continue;
+            };
+            if detected.account_key == slot.account_key {
+                continue;
+            }
+            let dir = self.slots_dir(HarnessId::Codex)?;
+            let id = slot_id_for(HarnessId::Codex, &detected.account_key);
+            // A slot already under the new key was written after the upgrade
+            // — it's the fresher copy.
+            if !dir.join(format!("{id}.json")).exists() {
+                let mut moved = slot.clone();
+                moved.id = id;
+                moved.account_key = detected.account_key;
+                moved.created_at = Some(slot.created_at.unwrap_or(slot.saved_at));
+                self.write_slot(&moved)?;
+            }
+            std::fs::remove_file(dir.join(format!("{}.json", slot.id)))?;
+        }
+        Ok(())
+    }
+
     // ── swap ────────────────────────────────────────────────────────────────
 
-    /// Swap the CLI's live login to a saved slot. Detection runs first, so the
-    /// CURRENT login is snapshotted into its slot before being overwritten (the
-    /// claude-swap trick — a swap never strands the session it replaces).
+    /// Swap the CLI's live login to a saved slot. The live login is synced
+    /// first, so the CURRENT session is snapshotted into its slot before being
+    /// overwritten (the claude-swap trick — a swap never strands the session
+    /// it replaces). Claude switches also hold Claude Code's own refresh
+    /// locks, so a concurrent refresh can't interleave with the swap.
     pub async fn activate(
         &self,
         harness: HarnessId,
         account_id: &str,
     ) -> Result<AgentAccountsSnapshot, EngineError> {
-        self.list(false).await?;
-        let slot = self
-            .read_slots(harness)
-            .into_iter()
-            .find(|s| s.id == account_id)
-            .ok_or_else(|| {
-                EngineError::Other(
-                    "That saved login no longer exists — refresh and try again.".into(),
-                )
-            })?;
-        match harness {
-            HarnessId::ClaudeCode => self.activate_claude(&slot).await?,
-            HarnessId::Codex => self.activate_codex(&slot)?,
-            HarnessId::Cursor => self.write_cursor_auth(&slot.credentials)?,
-            other => {
-                return Err(EngineError::Other(format!(
-                    "agent accounts are not supported for {other:?}"
-                )));
+        {
+            let _ops = self.inner.ops.lock().await;
+            let _claude_lock = match harness {
+                HarnessId::ClaudeCode => {
+                    Some(ClaudeRefreshLock::acquire(&self.inner.config.claude_config_dir).await?)
+                }
+                _ => None,
+            };
+            let live = self.sync_live(Some(harness)).await?;
+            if live.unsaved.contains(&harness) {
+                return Err(EngineError::Other(match harness {
+                    HarnessId::Codex => "Codex's current login couldn't be read, so switching \
+                                         would destroy it. Sign in again with Add account first."
+                        .into(),
+                    _ => "The CLI is signed in to an account Zeron hasn't saved — switching \
+                          would lose that login. Add it with Add account first."
+                        .into(),
+                }));
+            }
+            let slot = self
+                .read_slots(harness)
+                .into_iter()
+                .find(|s| s.id == account_id)
+                .ok_or_else(|| {
+                    EngineError::Other(
+                        "That saved login no longer exists — refresh and try again.".into(),
+                    )
+                })?;
+            // Writing a dead login live just signs the CLI out.
+            if slot_login_state(&slot).0 {
+                return Err(EngineError::Other(
+                    "That login has expired — Anthropic logins last about a month. Sign in \
+                     again with Add account."
+                        .into(),
+                ));
+            }
+            match harness {
+                HarnessId::ClaudeCode => self.activate_claude(&slot).await?,
+                HarnessId::Codex => self.activate_codex(&slot)?,
+                HarnessId::Cursor => self.write_cursor_auth(&slot.credentials)?,
+                other => {
+                    return Err(EngineError::Other(format!(
+                        "agent accounts are not supported for {other:?}"
+                    )));
+                }
             }
         }
         self.list(false).await
@@ -514,21 +918,24 @@ impl AgentAccounts {
         {
             return Err(EngineError::Other("Unknown account.".into()));
         }
-        let snapshot = self.list(false).await?;
-        let active = snapshot
-            .accounts
-            .iter()
-            .any(|a| a.harness == harness && a.id == account_id && a.active);
-        if active {
-            return Err(EngineError::Other(
-                "That's the live login — switch to another account first (it would just be \
-                 re-detected)."
-                    .into(),
-            ));
-        }
-        let file = self.slots_dir(harness)?.join(format!("{account_id}.json"));
-        if file.exists() {
-            std::fs::remove_file(&file)?;
+        {
+            let _ops = self.inner.ops.lock().await;
+            let live = self.sync_live(None).await?;
+            let active = live
+                .active_keys
+                .get(&harness)
+                .is_some_and(|key| slot_id_for(harness, key) == account_id);
+            if active {
+                return Err(EngineError::Other(
+                    "That's the live login — switch to another account first (it would just be \
+                     re-detected)."
+                        .into(),
+                ));
+            }
+            let file = self.slots_dir(harness)?.join(format!("{account_id}.json"));
+            if file.exists() {
+                std::fs::remove_file(&file)?;
+            }
         }
         self.list(false).await
     }
@@ -922,7 +1329,17 @@ impl AgentAccounts {
             }
         }
 
-        self.write_slot(&Slot {
+        if let Some(at) = token
+            .get("refresh_token_expires_in")
+            .and_then(|v| v.as_i64())
+            && let Some(map) = oauth.as_object_mut()
+        {
+            map.insert(
+                "refreshTokenExpiresAt".into(),
+                serde_json::json!(now_ms() + at * 1000),
+            );
+        }
+        let slot = Slot {
             id: slot_id_for(HarnessId::ClaudeCode, &account_uuid),
             harness: HarnessId::ClaudeCode,
             account_key: account_uuid.clone(),
@@ -937,7 +1354,21 @@ impl AgentAccounts {
             claude_config: Some(serde_json::json!({ "oauthAccount": oauth_account })),
             saved_at: now_ms(),
             created_at: None,
-        })?;
+        };
+        {
+            let _ops = self.inner.ops.lock().await;
+            self.write_slot(&slot)?;
+            // Signing in again to the LIVE account (typically to renew an
+            // expiring or rejected login) must renew the live store too —
+            // otherwise the next sync reads the old family back over the
+            // fresh slot (claude-swap #302) and nothing got renewed.
+            let (live, _) = self.detect_claude().await;
+            if live.is_some_and(|live| live.account_key == account_uuid) {
+                let _claude_lock =
+                    ClaudeRefreshLock::acquire(&self.inner.config.claude_config_dir).await?;
+                self.activate_claude(&slot).await?;
+            }
+        }
         lock(&self.inner.flows).remove(login_id);
         self.list(false).await
     }
@@ -975,16 +1406,33 @@ impl AgentAccounts {
             _ => None,
         });
         if let Some(detected) = detected {
-            self.snapshot_detected(harness, &detected)?;
-            // Cursor "Connect" semantics: with no (usable) live login, the
-            // fresh key becomes the live one immediately — the page's CTA is
-            // "connect so runs work", not "add a spare". A live login stays
-            // untouched (switching remains explicit, codex parity).
-            if harness == HarnessId::Cursor
-                && !self.cursor_live_usable()
-                && let Some(credentials) = &detected.credentials
             {
-                self.write_cursor_auth(credentials)?;
+                let _ops = self.inner.ops.lock().await;
+                self.snapshot_detected(harness, &detected)?;
+                // Cursor "Connect" semantics: with no (usable) live login, the
+                // fresh key becomes the live one immediately — the page's CTA is
+                // "connect so runs work", not "add a spare". A live login stays
+                // untouched (switching remains explicit, codex parity).
+                if harness == HarnessId::Cursor
+                    && !self.cursor_live_usable()
+                    && let Some(credentials) = &detected.credentials
+                {
+                    self.write_cursor_auth(credentials)?;
+                }
+                // Signing in again to the LIVE Codex account renews the live
+                // login too; otherwise the next sync would read the old tokens
+                // back over the fresh slot.
+                if harness == HarnessId::Codex
+                    && self
+                        .detect_codex()
+                        .is_some_and(|live| live.account_key == detected.account_key)
+                    && let Some(slot) = self
+                        .read_slots(HarnessId::Codex)
+                        .into_iter()
+                        .find(|s| s.account_key == detected.account_key)
+                {
+                    self.activate_codex(&slot)?;
+                }
             }
             self.cancel_login(login_id);
             return Ok(AgentLoginPoll {
@@ -1180,15 +1628,23 @@ impl AgentAccounts {
     /// Read the live Claude credentials. `None` payload + warning ⇒ we know a
     /// login exists but couldn't read the secret (Keychain denied us).
     async fn read_claude_credentials(&self) -> (Option<serde_json::Value>, Option<String>) {
-        if let Some(creds) = read_json(&self.inner.config.claude_creds_file()) {
-            return (Some(creds), None);
-        }
         #[cfg(target_os = "macos")]
         {
-            return keychain::read_credentials().await;
+            // Claude Code's own order: the Keychain first, `.credentials.json`
+            // only as its fallback. On macOS it writes rotations to the
+            // Keychain ONLY, so a file sitting next to a Keychain login can
+            // hold an already-consumed generation (or another account) —
+            // reading it as "live" would snapshot a dead token over the slot.
+            let service = &self.inner.config.claude_keychain_service;
+            match keychain::read_credentials(service).await {
+                (Some(creds), _) => return (Some(creds), None),
+                // Denied: the file may be that stale fallback — report the
+                // login as unreadable rather than serve it.
+                (None, Some(warning)) => return (None, Some(warning)),
+                (None, None) => {}
+            }
         }
-        #[cfg(not(target_os = "macos"))]
-        (None, None)
+        (read_json(&self.inner.config.claude_creds_file()), None)
     }
 
     async fn write_claude_credentials(
@@ -1198,10 +1654,18 @@ impl AgentAccounts {
         let json = credentials.to_string();
         #[cfg(target_os = "macos")]
         {
-            // claude-swap's primitive: update the Keychain item in place — but only
-            // when no credentials FILE exists (the file wins when present).
+            // The Keychain is the store Claude Code reads first. A fallback
+            // file, when present, is rewritten too so it can never shadow
+            // the switch with the previous account's (stale) tokens.
+            let service = &self.inner.config.claude_keychain_service;
+            let keychain = keychain::write_credentials(service, &json).await;
             if !self.inner.config.claude_creds_file().exists() {
-                return keychain::write_credentials(&json).await;
+                return keychain;
+            }
+            if let Err(err) = keychain {
+                // No usable Keychain (e.g. an SSH session): the file is the
+                // store Claude Code falls back to.
+                tracing::warn!(error = %err, "Keychain write failed; writing the credentials file");
             }
         }
         std::fs::create_dir_all(&self.inner.config.claude_config_dir)?;
@@ -1469,8 +1933,29 @@ impl AgentAccounts {
     }
 
     async fn refresh_claude_slot_once(&self, slot: &Slot) -> Option<String> {
+        // Under `ops`: a switch can't make this slot live between the checks
+        // and the POST (it would write the generation we're about to spend).
+        let _ops = self.inner.ops.lock().await;
+        // Re-read: the slot may have moved on since the list read it.
+        let slot = self
+            .read_slots(HarnessId::ClaudeCode)
+            .into_iter()
+            .find(|s| s.id == slot.id)?;
+        if slot_login_state(&slot).0 {
+            return None;
+        }
         let oauth = slot.credentials.get("claudeAiOauth")?.clone();
         let refresh_token = str_field(&oauth, "refreshToken")?;
+        // The live store holding this same generation means Claude Code owns
+        // it — spending it here would sign the running CLI out.
+        let (live, _) = self.read_claude_credentials().await;
+        if live
+            .as_ref()
+            .and_then(claude_refresh_token)
+            .is_some_and(|live| live == refresh_token)
+        {
+            return None;
+        }
         let body: serde_json::Value = self
             .inner
             .http
@@ -1504,6 +1989,15 @@ impl AgentAccounts {
                 "expiresAt".into(),
                 serde_json::json!(now_ms() + expires_in * 1000),
             );
+            if let Some(at) = body
+                .get("refresh_token_expires_in")
+                .and_then(|v| v.as_i64())
+            {
+                map.insert(
+                    "refreshTokenExpiresAt".into(),
+                    serde_json::json!(now_ms() + at * 1000),
+                );
+            }
         }
         let mut refreshed = slot.clone();
         // Keep sibling keys (mcpOAuth, pluginSecrets, …) — rewriting the blob
@@ -1521,7 +2015,9 @@ impl AgentAccounts {
 // ── macOS Keychain (documented here; compiled only on macOS) ────────────────
 //
 // Claude Code stores its credentials in the login Keychain under the service
-// `Claude Code-credentials`, account = the current username. Reads use
+// `Claude Code-credentials` (hash-suffixed for a relocated `CLAUDE_CONFIG_DIR`,
+// see [`AgentAccountsConfig::claude_keychain_service`]), account = the current
+// username. Reads use
 // `security find-generic-password` — two-step (existence probe needs no
 // authorization, then `-w` for the secret) so a user denial is distinguishable
 // from "not logged in". Writes use `add-generic-password -U` (update in place).
@@ -1552,8 +2048,10 @@ mod keychain {
         std::env::var("USER").unwrap_or_else(|_| "unknown".into())
     }
 
-    pub(super) async fn read_credentials() -> (Option<serde_json::Value>, Option<String>) {
-        let (probe_ok, ..) = exec(&["find-generic-password", "-s", KEYCHAIN_SERVICE]).await;
+    pub(super) async fn read_credentials(
+        service: &str,
+    ) -> (Option<serde_json::Value>, Option<String>) {
+        let (probe_ok, ..) = exec(&["find-generic-password", "-s", service]).await;
         if !probe_ok {
             return (None, None);
         }
@@ -1562,7 +2060,7 @@ mod keychain {
             "-a",
             &account(),
             "-s",
-            KEYCHAIN_SERVICE,
+            service,
             "-w",
         ])
         .await;
@@ -1585,14 +2083,14 @@ mod keychain {
         }
     }
 
-    pub(super) async fn write_credentials(json: &str) -> Result<(), EngineError> {
+    pub(super) async fn write_credentials(service: &str, json: &str) -> Result<(), EngineError> {
         let (ok, _, stderr) = exec(&[
             "add-generic-password",
             "-U",
             "-a",
             &account(),
             "-s",
-            KEYCHAIN_SERVICE,
+            service,
             "-w",
             json,
         ])
@@ -1653,6 +2151,74 @@ fn jwt_claims(jwt: &str) -> Option<serde_json::Value> {
         .or_else(|_| BASE64.decode(payload))
         .ok()?;
     serde_json::from_slice(&bytes).ok()
+}
+
+/// A token's identity for comparisons and caches — never the token itself.
+fn token_fingerprint(token: &str) -> String {
+    crate::repos::hex(&Sha256::digest(token.as_bytes()))
+}
+
+fn claude_refresh_token(credentials: &serde_json::Value) -> Option<String> {
+    str_field(credentials.get("claudeAiOauth")?, "refreshToken")
+}
+
+/// `refreshTokenExpiresAt` — when the login itself lapses. Anthropic stamps it
+/// at sign-in (~30 days out) and no refresh extends it.
+fn claude_login_expires_at(oauth: &serde_json::Value) -> Option<i64> {
+    oauth
+        .get("refreshTokenExpiresAt")
+        .and_then(|v| v.as_i64())
+        .filter(|at| *at > 0)
+}
+
+/// Whether a slot's Claude login is a LATER sign-in than the live `oauth`
+/// (a re-login stored in the slot while the store still holds the old family).
+fn claude_login_newer(
+    slot_credentials: &serde_json::Value,
+    live_oauth: &serde_json::Value,
+) -> bool {
+    let slot = slot_credentials
+        .get("claudeAiOauth")
+        .and_then(claude_login_expires_at);
+    matches!((slot, claude_login_expires_at(live_oauth)), (Some(s), Some(l)) if s > l)
+}
+
+/// `(needs_login, login_expires_at)` for a slot: a Claude login with no
+/// refresh token (emptied after a rejected refresh) or past its login
+/// deadline can only be fixed by signing in again.
+fn slot_login_state(slot: &Slot) -> (bool, Option<i64>) {
+    if slot.harness != HarnessId::ClaudeCode {
+        return (false, None);
+    }
+    let Some(oauth) = slot.credentials.get("claudeAiOauth") else {
+        return (false, None);
+    };
+    let expires_at = claude_login_expires_at(oauth);
+    let dead =
+        str_field(oauth, "refreshToken").is_none() || expires_at.is_some_and(|at| at <= now_ms());
+    (dead, expires_at)
+}
+
+/// Whether Codex's `auth.json` holds a secret worth protecting even though we
+/// can't parse an identity out of it (torn/unknown JSON, a token set without
+/// an `id_token`). An empty or logged-out file holds nothing.
+fn codex_auth_holds_secret(file: &Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(file) else {
+        return false;
+    };
+    if raw.trim().is_empty() {
+        return false;
+    }
+    match serde_json::from_str::<serde_json::Value>(&raw) {
+        Ok(auth) => {
+            str_field(&auth, "OPENAI_API_KEY").is_some()
+                || auth
+                    .get("tokens")
+                    .and_then(|t| str_field(t, "refresh_token"))
+                    .is_some()
+        }
+        Err(_) => true,
+    }
 }
 
 fn slot_id_for(harness: HarnessId, account_key: &str) -> String {
@@ -1794,8 +2360,18 @@ fn parse_codex_auth(auth: serde_json::Value) -> Option<Detected> {
             .cloned()
             .unwrap_or_default();
         let email = str_field(&claims, "email")?;
+        // Keyed by user AND workspace: every seat of a ChatGPT Team
+        // workspace shares one `chatgpt_account_id`, and one person can hold
+        // seats in several workspaces.
+        let workspace = str_field(&oa, "chatgpt_account_id");
+        let user = str_field(&oa, "chatgpt_user_id").or_else(|| str_field(&oa, "user_id"));
+        let account_key = match (user, workspace) {
+            (Some(user), Some(workspace)) => format!("{user}::{workspace}"),
+            (None, Some(workspace)) => workspace,
+            _ => email.clone(),
+        };
         return Some(Detected {
-            account_key: str_field(&oa, "chatgpt_account_id").unwrap_or_else(|| email.clone()),
+            account_key,
             profile: SlotProfile {
                 email,
                 display_name: str_field(&claims, "name"),

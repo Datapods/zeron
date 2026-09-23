@@ -36,6 +36,9 @@ fn test_accounts(root: &Path) -> (AgentAccounts, AgentAccountsConfig) {
         claude_config_file: root.join("claude.json"),
         codex_home: root.join("codex"),
         cursor_sdk_auth_file: root.join("cursor-sdk").join("auth.json"),
+        claude_keychain_service: "Claude Code-credentials-zeron-test".into(),
+        // Refused instantly: ownership is "unverifiable" unless a test serves it.
+        claude_profile_url: "http://127.0.0.1:9/api/oauth/profile".into(),
     };
     (AgentAccounts::new(config.clone()), config)
 }
@@ -434,6 +437,485 @@ async fn codex_slot_swap_and_api_key_detection() {
         .expect("api key account");
     assert_eq!(key_account.plan_label.as_deref(), Some("API key"));
     assert_eq!(key_account.email.as_deref(), Some("API key ·…abcd"));
+}
+
+// ---------------------------------------------------------------------------
+// Switch stability: the ways a swap used to cost a saved login
+// ---------------------------------------------------------------------------
+
+/// Overwrite only the live Claude credential store (the identity file is left
+/// alone — exactly what a still-running Claude Code session does when it
+/// refreshes and saves its in-memory login).
+fn write_claude_tokens(config: &AgentAccountsConfig, oauth: serde_json::Value) {
+    std::fs::write(
+        config.claude_config_dir.join(".credentials.json"),
+        serde_json::json!({ "claudeAiOauth": oauth }).to_string(),
+    )
+    .expect("claude creds");
+}
+
+fn live_tokens(access: &str, refresh: &str) -> serde_json::Value {
+    serde_json::json!({
+        "accessToken": access,
+        "refreshToken": refresh,
+        "expiresAt": 4_102_444_800_000i64,
+    })
+}
+
+/// The stored slot for `account_key`'s refresh token (read straight off disk).
+fn slot_refresh_token(config: &AgentAccountsConfig, email: &str) -> Option<String> {
+    let dir = config.data_dir.join("agent-accounts").join("claude-code");
+    std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+        .filter_map(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .find(|slot| slot["profile"]["email"] == email)
+        .and_then(|slot| {
+            slot["credentials"]["claudeAiOauth"]["refreshToken"]
+                .as_str()
+                .map(str::to_string)
+        })
+}
+
+fn active_email(snapshot: &AgentAccountsSnapshot, harness: HarnessId) -> Option<String> {
+    snapshot
+        .accounts
+        .iter()
+        .find(|a| a.harness == harness && a.active)
+        .and_then(|a| a.email.clone())
+}
+
+fn account_id(snapshot: &AgentAccountsSnapshot, email: &str) -> String {
+    snapshot
+        .accounts
+        .iter()
+        .find(|a| a.email.as_deref() == Some(email))
+        .unwrap_or_else(|| panic!("{email} listed"))
+        .id
+        .clone()
+}
+
+/// A stand-in for Anthropic's `/api/oauth/profile`: answers with the account
+/// each bearer token was registered to, 401 for anything else.
+async fn serve_claude_profiles(owners: Vec<(&'static str, &'static str, &'static str)>) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let owners = owners.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 16 * 1024];
+                let mut len = 0;
+                while len < buf.len() {
+                    let read = socket.read(&mut buf[len..]).await.unwrap_or(0);
+                    if read == 0 {
+                        break;
+                    }
+                    len += read;
+                    if buf[..len].windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8_lossy(&buf[..len]).to_lowercase();
+                let owner = owners
+                    .iter()
+                    .find(|(token, ..)| request.contains(&format!("bearer {token}")));
+                let (status, body) = match owner {
+                    Some((_, uuid, email)) => (
+                        "200 OK",
+                        serde_json::json!({ "account": { "uuid": uuid, "email_address": email } })
+                            .to_string(),
+                    ),
+                    None => ("401 Unauthorized", "{}".to_string()),
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    format!("http://{addr}/api/oauth/profile")
+}
+
+#[tokio::test]
+async fn claude_wiped_login_never_overwrites_its_slot() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (accounts, config) = test_accounts(tmp.path());
+    write_claude_login(&config, "alice@example.com", "uuid-alice", "token-alice");
+    accounts.list(false).await.expect("list");
+
+    // Claude Code's reaction to a rejected refresh: tokens emptied in place,
+    // wrapper and metadata kept.
+    write_claude_tokens(
+        &config,
+        serde_json::json!({
+            "accessToken": "",
+            "refreshToken": "",
+            "expiresAt": 0,
+            "scopes": ["user:inference"],
+            "subscriptionType": "max",
+        }),
+    );
+    let snapshot = accounts.list(false).await.expect("list wiped");
+    assert_eq!(
+        slot_refresh_token(&config, "alice@example.com").as_deref(),
+        Some("refresh-token-alice"),
+        "the emptied login must not be snapshotted over the slot"
+    );
+    assert!(
+        snapshot
+            .warnings
+            .iter()
+            .any(|w| w.harness == HarnessId::ClaudeCode && w.message.contains("signed out")),
+        "the sign-out is surfaced: {:?}",
+        snapshot.warnings
+    );
+}
+
+#[tokio::test]
+async fn claude_stale_session_write_back_does_not_poison_slots() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (_, mut config) = test_accounts(tmp.path());
+    config.claude_profile_url =
+        serve_claude_profiles(vec![("token-bob-2", "uuid-bob", "bob@example.com")]).await;
+    let accounts = AgentAccounts::new(config.clone());
+
+    write_claude_login(&config, "alice@example.com", "uuid-alice", "token-alice");
+    accounts.list(false).await.expect("list alice");
+    write_claude_login(&config, "bob@example.com", "uuid-bob", "token-bob");
+    let snapshot = accounts.list(false).await.expect("list bob");
+    accounts
+        .activate(
+            HarnessId::ClaudeCode,
+            &account_id(&snapshot, "alice@example.com"),
+        )
+        .await
+        .expect("switch to alice");
+
+    // A Claude Code session still running as Bob saves its login back over
+    // the switch; ~/.claude.json keeps naming Alice (claude-swap #117).
+    write_claude_tokens(&config, live_tokens("token-bob", "refresh-token-bob"));
+    let snapshot = accounts.list(false).await.expect("list after write-back");
+    assert_eq!(
+        slot_refresh_token(&config, "alice@example.com").as_deref(),
+        Some("refresh-token-alice"),
+        "Alice's slot keeps her own login"
+    );
+    assert_eq!(
+        active_email(&snapshot, HarnessId::ClaudeCode).as_deref(),
+        Some("bob@example.com"),
+        "the tokens are Bob's, so Bob is what the CLI really runs as"
+    );
+    assert!(
+        snapshot
+            .warnings
+            .iter()
+            .any(|w| w.message.contains("signed in as bob@example.com")),
+        "{:?}",
+        snapshot.warnings
+    );
+
+    // That session then rotates Bob's tokens: a lineage no slot holds. The
+    // token itself says it's Bob's — his slot takes the rotation, Alice's
+    // stays hers.
+    write_claude_tokens(&config, live_tokens("token-bob-2", "refresh-bob-2"));
+    accounts.list(false).await.expect("list after rotation");
+    assert_eq!(
+        slot_refresh_token(&config, "bob@example.com").as_deref(),
+        Some("refresh-bob-2")
+    );
+    assert_eq!(
+        slot_refresh_token(&config, "alice@example.com").as_deref(),
+        Some("refresh-token-alice")
+    );
+
+    // Switching back to Alice straightens the live store out again.
+    let snapshot = accounts.list(false).await.expect("list");
+    accounts
+        .activate(
+            HarnessId::ClaudeCode,
+            &account_id(&snapshot, "alice@example.com"),
+        )
+        .await
+        .expect("switch back to alice");
+    let creds: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(config.claude_config_dir.join(".credentials.json"))
+            .expect("creds"),
+    )
+    .expect("creds json");
+    assert_eq!(
+        creds["claudeAiOauth"]["refreshToken"],
+        "refresh-token-alice"
+    );
+}
+
+#[tokio::test]
+async fn claude_rotation_is_saved_once_verified_or_on_switch() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (_, mut config) = test_accounts(tmp.path());
+    config.claude_profile_url =
+        serve_claude_profiles(vec![("token-alice-2", "uuid-alice", "alice@example.com")]).await;
+    let accounts = AgentAccounts::new(config.clone());
+
+    write_claude_login(&config, "bob@example.com", "uuid-bob", "token-bob");
+    accounts.list(false).await.expect("list bob");
+    write_claude_login(&config, "alice@example.com", "uuid-alice", "token-alice");
+    accounts.list(false).await.expect("list alice");
+
+    // Claude Code's routine rotation, verifiable: saved on the next list.
+    write_claude_tokens(&config, live_tokens("token-alice-2", "refresh-alice-2"));
+    accounts.list(false).await.expect("list rotated");
+    assert_eq!(
+        slot_refresh_token(&config, "alice@example.com").as_deref(),
+        Some("refresh-alice-2")
+    );
+
+    // Unverifiable (the endpoint doesn't know this token): a list leaves the
+    // slot alone…
+    write_claude_tokens(&config, live_tokens("token-alice-3", "refresh-alice-3"));
+    let snapshot = accounts.list(false).await.expect("list unverified");
+    assert_eq!(
+        slot_refresh_token(&config, "alice@example.com").as_deref(),
+        Some("refresh-alice-2")
+    );
+    // …but a switch away saves it, rather than strand the only live copy.
+    accounts
+        .activate(
+            HarnessId::ClaudeCode,
+            &account_id(&snapshot, "bob@example.com"),
+        )
+        .await
+        .expect("switch to bob");
+    assert_eq!(
+        slot_refresh_token(&config, "alice@example.com").as_deref(),
+        Some("refresh-alice-3")
+    );
+}
+
+#[tokio::test]
+async fn claude_expired_login_asks_for_sign_in_instead_of_switching() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (accounts, config) = test_accounts(tmp.path());
+    write_claude_login(&config, "alice@example.com", "uuid-alice", "token-alice");
+    // Alice's login deadline (stamped at sign-in, never extended) passed.
+    write_claude_tokens(
+        &config,
+        serde_json::json!({
+            "accessToken": "token-alice",
+            "refreshToken": "refresh-token-alice",
+            "expiresAt": 4_102_444_800_000i64,
+            "refreshTokenExpiresAt": 1_000i64,
+        }),
+    );
+    accounts.list(false).await.expect("list alice");
+    write_claude_login(&config, "bob@example.com", "uuid-bob", "token-bob");
+    let snapshot = accounts.list(false).await.expect("list bob");
+    let alice = snapshot
+        .accounts
+        .iter()
+        .find(|a| a.email.as_deref() == Some("alice@example.com"))
+        .expect("alice");
+    assert!(alice.needs_login);
+    assert!(!alice.switchable);
+    assert_eq!(alice.login_expires_at, Some(1_000));
+
+    let refused = accounts
+        .activate(HarnessId::ClaudeCode, &alice.id)
+        .await
+        .expect_err("a dead login is never written live");
+    assert!(refused.to_string().contains("expired"), "{refused}");
+    let creds: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(config.claude_config_dir.join(".credentials.json"))
+            .expect("creds"),
+    )
+    .expect("creds json");
+    assert_eq!(creds["claudeAiOauth"]["accessToken"], "token-bob");
+}
+
+#[tokio::test]
+async fn claude_switch_takes_and_releases_claude_codes_refresh_locks() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (accounts, config) = test_accounts(tmp.path());
+    write_claude_login(&config, "alice@example.com", "uuid-alice", "token-alice");
+    accounts.list(false).await.expect("list alice");
+    write_claude_login(&config, "bob@example.com", "uuid-bob", "token-bob");
+    let snapshot = accounts.list(false).await.expect("list bob");
+
+    // A lock left behind by a crashed Claude Code (older than its 60s
+    // staleness bound) must not wedge the switch.
+    let primary = config.claude_config_dir.join(".oauth_refresh.lock");
+    std::fs::create_dir(&primary).expect("stale lock");
+    std::fs::File::open(&primary)
+        .expect("open lock dir")
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(120))
+        .expect("age lock");
+
+    accounts
+        .activate(
+            HarnessId::ClaudeCode,
+            &account_id(&snapshot, "alice@example.com"),
+        )
+        .await
+        .expect("switch past a stale lock");
+    let mut legacy = config.claude_config_dir.clone().into_os_string();
+    legacy.push(".lock");
+    assert!(!primary.exists(), "primary refresh lock released");
+    assert!(!PathBuf::from(legacy).exists(), "legacy lock released");
+}
+
+/// A codex login for one seat: `user_id` inside workspace `account_id`.
+fn write_codex_seat(config: &AgentAccountsConfig, email: &str, user_id: &str, account_id: &str) {
+    let header = BASE64_URL.encode(br#"{"alg":"none"}"#);
+    let payload = BASE64_URL.encode(
+        serde_json::json!({
+            "email": email,
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": account_id,
+                "chatgpt_user_id": user_id,
+                "chatgpt_plan_type": "team",
+            },
+        })
+        .to_string(),
+    );
+    std::fs::create_dir_all(&config.codex_home).expect("codex home");
+    std::fs::write(
+        config.codex_home.join("auth.json"),
+        serde_json::json!({
+            "tokens": {
+                "id_token": format!("{header}.{payload}.x"),
+                "access_token": format!("at-{user_id}"),
+                "refresh_token": format!("rt-{user_id}"),
+                "account_id": account_id,
+            }
+        })
+        .to_string(),
+    )
+    .expect("codex auth");
+}
+
+#[tokio::test]
+async fn codex_team_seats_keep_separate_slots() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (accounts, config) = test_accounts(tmp.path());
+
+    // Two teammates in ONE ChatGPT Team workspace share its account id.
+    write_codex_seat(&config, "erin@team.com", "user-erin", "ws-team");
+    accounts.list(false).await.expect("list erin");
+    write_codex_seat(&config, "finn@team.com", "user-finn", "ws-team");
+    let snapshot = accounts.list(false).await.expect("list finn");
+    let mut emails = account_emails(&snapshot, HarnessId::Codex);
+    emails.sort();
+    assert_eq!(
+        emails,
+        vec![
+            ("erin@team.com".to_string(), false),
+            ("finn@team.com".to_string(), true)
+        ]
+    );
+
+    accounts
+        .activate(HarnessId::Codex, &account_id(&snapshot, "erin@team.com"))
+        .await
+        .expect("switch to erin");
+    let auth: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(config.codex_home.join("auth.json")).expect("auth"),
+    )
+    .expect("auth json");
+    assert_eq!(auth["tokens"]["refresh_token"], "rt-user-erin");
+}
+
+#[tokio::test]
+async fn codex_workspace_keyed_slots_are_rekeyed_in_place() {
+    use sha2::Digest as _;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (accounts, config) = test_accounts(tmp.path());
+
+    // A slot saved before seats were told apart: keyed by workspace alone.
+    write_codex_seat(&config, "erin@team.com", "user-erin", "ws-team");
+    let auth: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(config.codex_home.join("auth.json")).expect("auth"),
+    )
+    .expect("auth json");
+    let legacy_id = {
+        let digest = sha2::Sha256::digest(b"codex:ws-team");
+        digest[..8]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    };
+    let dir = config.data_dir.join("agent-accounts").join("codex");
+    std::fs::create_dir_all(&dir).expect("slots dir");
+    std::fs::write(
+        dir.join(format!("{legacy_id}.json")),
+        serde_json::json!({
+            "id": legacy_id,
+            "harness": "codex",
+            "accountKey": "ws-team",
+            "profile": { "email": "erin@team.com", "authKind": "oauth" },
+            "credentials": auth,
+            "savedAt": 5,
+            "createdAt": 5,
+        })
+        .to_string(),
+    )
+    .expect("legacy slot");
+    // The live login is someone else, so the migration alone must carry Erin.
+    write_codex_seat(&config, "finn@team.com", "user-finn", "ws-team");
+
+    let snapshot = accounts.list(false).await.expect("list");
+    let erin: Vec<_> = snapshot
+        .accounts
+        .iter()
+        .filter(|a| a.email.as_deref() == Some("erin@team.com"))
+        .collect();
+    assert_eq!(erin.len(), 1, "exactly one Erin slot");
+    assert_ne!(erin[0].id, legacy_id, "re-keyed");
+    assert!(!erin[0].active);
+    assert!(!dir.join(format!("{legacy_id}.json")).exists());
+    assert_eq!(
+        snapshot.accounts[0].email.as_deref(),
+        Some("erin@team.com"),
+        "creation order kept"
+    );
+}
+
+#[tokio::test]
+async fn codex_unreadable_live_login_blocks_the_switch() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (accounts, config) = test_accounts(tmp.path());
+    write_codex_login(&config, "carol@example.com", "acct-carol");
+    let snapshot = accounts.list(false).await.expect("list carol");
+    let carol = account_id(&snapshot, "carol@example.com");
+
+    // A login we can't parse is a login we can't back up.
+    std::fs::write(
+        config.codex_home.join("auth.json"),
+        r#"{"tokens":{"refresh_token":"rt-mystery"}}"#,
+    )
+    .expect("opaque auth");
+    let snapshot = accounts.list(false).await.expect("list opaque");
+    assert!(
+        snapshot
+            .warnings
+            .iter()
+            .any(|w| w.harness == HarnessId::Codex),
+        "{:?}",
+        snapshot.warnings
+    );
+    accounts
+        .activate(HarnessId::Codex, &carol)
+        .await
+        .expect_err("switching would destroy the unsaved login");
+    assert_eq!(
+        std::fs::read_to_string(config.codex_home.join("auth.json")).expect("auth"),
+        r#"{"tokens":{"refresh_token":"rt-mystery"}}"#
+    );
 }
 
 #[tokio::test]

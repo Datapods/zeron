@@ -905,6 +905,14 @@ pub struct AgentAccount {
     /// Epoch millis of the slot's last snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub saved_at: Option<i64>,
+    /// Epoch millis when the saved login itself lapses (Claude stamps a
+    /// deadline ~30 days after sign-in that no token refresh extends).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login_expires_at: Option<i64>,
+    /// The saved login is dead (expired, or its tokens were revoked) — only
+    /// signing in again fixes it; switching to it is refused.
+    #[serde(default)]
+    pub needs_login: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

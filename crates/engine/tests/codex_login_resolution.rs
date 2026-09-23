@@ -18,6 +18,9 @@ fn test_accounts(root: &Path) -> AgentAccounts {
         claude_config_file: root.join("claude.json"),
         codex_home: root.join("codex"),
         cursor_sdk_auth_file: root.join("cursor-sdk").join("auth.json"),
+        claude_keychain_service: "Claude Code-credentials-zeron-test".into(),
+        // Refused instantly: ownership is "unverifiable" unless a test serves it.
+        claude_profile_url: "http://127.0.0.1:9/api/oauth/profile".into(),
     };
     AgentAccounts::new(config)
 }

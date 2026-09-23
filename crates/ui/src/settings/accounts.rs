@@ -115,6 +115,26 @@ pub fn format_reset(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Opt
     })
 }
 
+/// The login-deadline line for an account row: dead logins ask for a sign-in,
+/// and a login inside its last week counts down (Claude logins lapse ~30 days
+/// after sign-in, and a parked account never sees Claude Code's own nudge).
+/// Pure given `now`.
+pub fn login_note(account: &AgentAccount, now: DateTime<Utc>) -> Option<String> {
+    if account.needs_login {
+        return Some("Login expired — sign in again".into());
+    }
+    let left_ms = account.login_expires_at? - now.timestamp_millis();
+    const DAY_MS: i64 = 86_400_000;
+    if left_ms > 7 * DAY_MS {
+        return None;
+    }
+    let days = (left_ms + DAY_MS - 1) / DAY_MS;
+    Some(match days {
+        ..=1 => "Login expires within a day — sign in again to renew".into(),
+        days => format!("Login expires in {days} days — sign in again to renew"),
+    })
+}
+
 /// The provider cards, in display order: (harness, name, CLI command — named
 /// in the empty-state copy, zeron settings.agents.tsx `PROVIDERS`).
 pub const PROVIDERS: [(HarnessId, &str, &str); 3] = [
@@ -794,6 +814,8 @@ impl AccountsPage {
             .into();
         let switch_account = account.clone();
         let forget_account = account.clone();
+        let login_harness = account.harness;
+        let note = login_note(account, now);
 
         let badges = div()
             .flex()
@@ -856,7 +878,29 @@ impl AccountsPage {
                         })),
                     )
                 })
+                // A dead login can't be switched to — renewing it is a sign-in.
+                .when(account.needs_login, |el| {
+                    el.child(
+                        crate::popover::btn_primary(theme, "Sign in")
+                            .id(("account-sign-in", ix))
+                            .px(px(8.0))
+                            .py(px(4.0))
+                            .rounded(px(6.0))
+                            .text_size(crate::typography::ui_rems(11.5))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.start_login(login_harness, cx);
+                            })),
+                    )
+                })
         });
+        let note_line = |text: String| {
+            div()
+                .mt(px(6.0))
+                .truncate()
+                .text_size(crate::typography::ui_rems(11.5))
+                .text_color(theme.text_muted.opacity(0.6))
+                .child(SharedString::from(text))
+        };
 
         div()
             .px(px(20.0))
@@ -895,18 +939,13 @@ impl AccountsPage {
                         // Meters XOR the quiet fallback line — never both
                         // (zeron: `usage ? meters : "Usage unavailable"…`).
                         if account.usage_windows.is_empty() {
-                            el.child(
-                                div()
-                                    .mt(px(6.0))
-                                    .truncate()
-                                    .text_size(crate::typography::ui_rems(11.5))
-                                    .text_color(theme.text_muted.opacity(0.6))
-                                    .child(SharedString::from(if account.switchable {
-                                        "Usage unavailable"
-                                    } else {
-                                        "Credentials unavailable"
-                                    })),
-                            )
+                            el.child(note_line(note.clone().unwrap_or_else(|| {
+                                if account.switchable {
+                                    "Usage unavailable".into()
+                                } else {
+                                    "Credentials unavailable".into()
+                                }
+                            })))
                         } else {
                             el.child(
                                 div().mt(px(6.0)).flex().flex_col().gap(px(4.0)).children(
@@ -916,6 +955,7 @@ impl AccountsPage {
                                         .map(|w| self.render_usage_meter(w, theme, now)),
                                 ),
                             )
+                            .when_some(note.clone(), |el, note| el.child(note_line(note)))
                         }
                     }),
             )
@@ -1587,6 +1627,41 @@ mod tests {
     }
 
     #[test]
+    fn login_note_counts_down_the_last_week_and_flags_dead_logins() {
+        let now = Utc::now();
+        let day = 86_400_000;
+        let account = |expires_in: Option<i64>, needs_login: bool| AgentAccount {
+            id: "a".into(),
+            harness: HarnessId::ClaudeCode,
+            email: None,
+            plan_label: None,
+            active: false,
+            usage_windows: vec![],
+            display_name: None,
+            organization: None,
+            auth_kind: None,
+            switchable: !needs_login,
+            saved_at: None,
+            login_expires_at: expires_in.map(|ms| now.timestamp_millis() + ms),
+            needs_login,
+        };
+        assert_eq!(login_note(&account(None, false), now), None);
+        assert_eq!(login_note(&account(Some(20 * day), false), now), None);
+        assert_eq!(
+            login_note(&account(Some(3 * day - 1_000), false), now).as_deref(),
+            Some("Login expires in 3 days — sign in again to renew")
+        );
+        assert_eq!(
+            login_note(&account(Some(day / 2), false), now).as_deref(),
+            Some("Login expires within a day — sign in again to renew")
+        );
+        assert_eq!(
+            login_note(&account(Some(-day), true), now).as_deref(),
+            Some("Login expired — sign in again")
+        );
+    }
+
+    #[test]
     fn provider_grouping_keeps_engine_order_even_when_active_is_later() {
         let account = |id: &str, harness: HarnessId, active: bool| AgentAccount {
             id: id.into(),
@@ -1600,6 +1675,8 @@ mod tests {
             auth_kind: None,
             switchable: true,
             saved_at: None,
+            login_expires_at: None,
+            needs_login: false,
         };
         let snapshot = AgentAccountsSnapshot {
             accounts: vec![
