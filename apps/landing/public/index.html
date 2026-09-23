@@ -187,6 +187,23 @@
   }
   .all-downloads { font-size: 13.5px; color: var(--dim); transition: color .15s; }
   .all-downloads:hover { color: var(--ink); }
+  .used-by { margin-top: 44px; }
+  .used-by p { font-size: 12.5px; color: var(--faint); }
+  .used-by-logos {
+    margin-top: 16px;
+    display: flex;
+    align-items: center;
+    gap: 30px;
+    flex-wrap: wrap;
+  }
+  .used-by-logos a { display: inline-flex; }
+  .used-by-logos img {
+    width: auto;
+    filter: grayscale(1);
+    opacity: 0.55;
+    transition: filter .2s, opacity .2s;
+  }
+  .used-by-logos a:hover img { filter: none; opacity: 1; }
   .hero-ascii {
     justify-self: end;
     font-family: var(--mono);
@@ -236,7 +253,7 @@
     display: flex;
     align-items: center;
     gap: 26px;
-    margin-top: 40px;
+    margin-bottom: 32px;
     flex-wrap: wrap;
   }
   .agent-icon {
@@ -757,7 +774,7 @@
     h1 { font-size: clamp(32px, 9vw, 38px); }
     .hero p.sub { font-size: 15px; }
     .hero .cta-row { margin-top: 28px; }
-    .agents { gap: 22px; margin-top: 30px; }
+    .agents { gap: 22px; margin-bottom: 26px; }
     .agent-icon { width: 20px; height: 20px; }
     .shot { padding: 28px 0 0; }
     .shot img { border-radius: 4px; }
@@ -805,6 +822,16 @@
   <header class="hero">
     <div class="wrap hero-grid">
       <div>
+        <div class="agents" aria-label="Supported agents">
+          <span class="agent-icon" title="Claude Code" style="--icon: url('/assets/icons/claude-mark.svg')"></span>
+          <span class="agent-icon" title="Codex" style="--icon: url('/assets/icons/openai-mark.svg')"></span>
+          <span class="agent-icon" title="Cursor" style="--icon: url('/assets/icons/cursor-mark.svg')"></span>
+          <span class="agent-icon" title="Grok" style="--icon: url('/assets/icons/grok-mark.svg')"></span>
+          <span class="agent-icon" title="Hermes" style="--icon: url('/assets/icons/hermes-mark.svg')"></span>
+          <span class="agent-icon" title="Pi" style="--icon: url('/assets/icons/pi-mark.svg')"></span>
+          <span class="agent-icon" title="Devin" style="--icon: url('/assets/icons/devin-mark.svg')"></span>
+          <span class="agent-icon" title="OpenCode" style="--icon: url('/assets/icons/opencode-mark.svg')"></span>
+        </div>
         <h1>Access your agents from any device.</h1>
         <p class="sub">
           Zeron runs Claude Code, Codex, Grok, Hermes and Pi on your
@@ -815,15 +842,13 @@
           <a class="all-downloads" href="#downloads">All downloads ↓</a>
           <span class="cta-ver" id="ver">v0.2.66</span>
         </div>
-        <div class="agents" aria-label="Supported agents">
-          <span class="agent-icon" title="Claude Code" style="--icon: url('/assets/icons/claude-mark.svg')"></span>
-          <span class="agent-icon" title="Codex" style="--icon: url('/assets/icons/openai-mark.svg')"></span>
-          <span class="agent-icon" title="Cursor" style="--icon: url('/assets/icons/cursor-mark.svg')"></span>
-          <span class="agent-icon" title="Grok" style="--icon: url('/assets/icons/grok-mark.svg')"></span>
-          <span class="agent-icon" title="Hermes" style="--icon: url('/assets/icons/hermes-mark.svg')"></span>
-          <span class="agent-icon" title="Pi" style="--icon: url('/assets/icons/pi-mark.svg')"></span>
-          <span class="agent-icon" title="Devin" style="--icon: url('/assets/icons/devin-mark.svg')"></span>
-          <span class="agent-icon" title="OpenCode" style="--icon: url('/assets/icons/opencode-mark.svg')"></span>
+        <div class="used-by">
+          <p>Used by developers from</p>
+          <div class="used-by-logos">
+            <a href="https://cursor.com" target="_blank" rel="noopener"><img src="/assets/logos/cursor.svg" alt="Cursor" height="20" /></a>
+            <a href="https://unsloth.ai" target="_blank" rel="noopener"><img src="/assets/logos/unsloth.png" alt="Unsloth" height="26" /></a>
+            <a href="https://www.thecontextcompany.com" target="_blank" rel="noopener"><img src="/assets/logos/thecontextcompany.png" alt="The Context Company" height="16" /></a>
+          </div>
         </div>
       </div>
       <pre class="hero-ascii" aria-hidden="true">++=========+=====+++++++++++******+++++++++++++++++++++*****#############%%######***#######*#%#######****#####
