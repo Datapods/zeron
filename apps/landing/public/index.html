@@ -196,14 +196,21 @@
     gap: 30px;
     flex-wrap: wrap;
   }
-  .used-by-logos a { display: inline-flex; }
-  .used-by-logos img {
-    width: auto;
-    filter: grayscale(1);
-    opacity: 0.55;
-    transition: filter .2s, opacity .2s;
+  /* at rest each logo is a --faint silhouette, like .agent-icon; hover
+     fades the real brand colors in */
+  .used-by-logos a { position: relative; display: inline-flex; }
+  .used-by-logos a::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background-color: var(--faint);
+    -webkit-mask: var(--logo) no-repeat center / contain;
+    mask: var(--logo) no-repeat center / contain;
+    transition: opacity .2s;
   }
-  .used-by-logos a:hover img { filter: none; opacity: 1; }
+  .used-by-logos img { width: auto; opacity: 0; transition: opacity .2s; }
+  .used-by-logos a:hover::after { opacity: 0; }
+  .used-by-logos a:hover img { opacity: 1; }
   .hero-ascii {
     justify-self: end;
     font-family: var(--mono);
@@ -845,9 +852,9 @@
         <div class="used-by">
           <p>Used by developers from</p>
           <div class="used-by-logos">
-            <a href="https://cursor.com" target="_blank" rel="noopener"><img src="/assets/logos/cursor.svg" alt="Cursor" height="20" /></a>
-            <a href="https://unsloth.ai" target="_blank" rel="noopener"><img src="/assets/logos/unsloth.png" alt="Unsloth" height="26" /></a>
-            <a href="https://www.thecontextcompany.com" target="_blank" rel="noopener"><img src="/assets/logos/thecontextcompany.png" alt="The Context Company" height="16" /></a>
+            <a href="https://cursor.com" target="_blank" rel="noopener" style="--logo: url('/assets/logos/cursor.svg')"><img src="/assets/logos/cursor.svg" alt="Cursor" height="20" /></a>
+            <a href="https://unsloth.ai" target="_blank" rel="noopener" style="--logo: url('/assets/logos/unsloth-mask.png')"><img src="/assets/logos/unsloth.png" alt="Unsloth" height="26" /></a>
+            <a href="https://www.thecontextcompany.com" target="_blank" rel="noopener" style="--logo: url('/assets/logos/thecontextcompany.png')"><img src="/assets/logos/thecontextcompany.png" alt="The Context Company" height="16" /></a>
           </div>
         </div>
       </div>
