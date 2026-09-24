@@ -3022,6 +3022,13 @@ pub struct Transcript {
     state: Entity<AppState>,
     list: ListState,
     rows: Vec<Row>,
+    /// Bumped whenever `rows` is replaced, for caches keyed on row positions.
+    pub(crate) rows_generation: u64,
+    /// Keyed by (selected chat, transcript revision, rows generation).
+    pub(crate) rail_pairs_cache: Option<(
+        (Option<String>, u64, u64),
+        std::rc::Rc<Vec<(crate::rail::RailTick, usize)>>,
+    )>,
     last_source: Option<(Option<String>, TranscriptReplayState, u64)>,
     chat_id: Option<String>,
     /// The shell may retain this already-laid-out view briefly for its exit.
@@ -3413,6 +3420,8 @@ impl Transcript {
             rail_enabled,
             bottom_clearance: 0.0,
             rail_hover: None,
+            rows_generation: 0,
+            rail_pairs_cache: None,
             hovered_entry: None,
             copied_code: None,
             copied_clear: None,
@@ -4487,6 +4496,7 @@ impl Transcript {
             }
             self.chat_id = selected;
             self.rows.clear();
+            self.rows_generation = self.rows_generation.wrapping_add(1);
             self.row_cache.clear();
             self.live_parsers.clear();
             self.tree_cache.clear();
@@ -4848,6 +4858,7 @@ impl Transcript {
         match diff_rows(&self.rows, &new_rows) {
             None => {
                 self.rows = new_rows;
+                self.rows_generation = self.rows_generation.wrapping_add(1);
                 self.refresh_protected_attachments(cx);
                 self.reconcile_own_turn_prompt();
                 // Replay readiness is independent of row content: an empty
@@ -4886,6 +4897,7 @@ impl Transcript {
             }
         }
         self.rows = new_rows;
+        self.rows_generation = self.rows_generation.wrapping_add(1);
         if old_last != self.rows.len().checked_sub(1) {
             if let Some(ix) = old_last.filter(|&ix| ix < self.rows.len()) {
                 // Bottom chrome moves to the new tail too.

@@ -8659,6 +8659,22 @@ impl Shell {
                 .update(cx, |transcript, cx| transcript.finish_route_exit(cx));
         }
         let outlet: AnyElement = if has_selection || departing_transcript {
+            // Every composer keystroke re-renders the Shell as its ancestor; an
+            // uncached transcript re-rendered with it, at a cost proportional
+            // to the whole conversation. A reused scene replays the opacity and
+            // offset it was painted with, so the dock transition stays uncached.
+            let settled = has_selection
+                && transcript_geometry_ready
+                && !dock_frame.active
+                && dock_frame.transcript() >= 1.0;
+            let transcript = if settled {
+                self.transcript
+                    .clone()
+                    .cached(gpui::StyleRefinement::default().size_full())
+                    .into_any_element()
+            } else {
+                self.transcript.clone().into_any_element()
+            };
             div()
                 .relative()
                 .size_full()
@@ -8674,7 +8690,7 @@ impl Shell {
                         } else {
                             0.0
                         })
-                        .child(self.transcript.clone()),
+                        .child(transcript),
                 )
                 // A departing transcript is visual history, not an active
                 // interaction surface bound to the newly blank route.

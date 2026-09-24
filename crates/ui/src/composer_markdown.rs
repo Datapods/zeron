@@ -32,6 +32,12 @@ pub fn faces(text: &str) -> Vec<(Range<usize>, Face)> {
     .collect()
 }
 
+/// Whether [`syntax_spans`] can return anything: only fenced code is
+/// highlighted, and a fence needs at least three backticks or tildes.
+pub fn may_contain_fence(text: &str) -> bool {
+    text.contains("```") || text.contains("~~~")
+}
+
 /// Highlight fenced code with its own grammar. Running the Markdown grammar
 /// over the whole draft colors fence bodies as strings, including identifiers.
 /// Keep prose and fence markers neutral, and retain exact source byte offsets.

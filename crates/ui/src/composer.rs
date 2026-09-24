@@ -4472,6 +4472,16 @@ impl Render for ComposerInput {
         if self.mentions_enabled && self.syntax_source != self.content {
             self.syntax_source = self.content.clone();
             self.syntax_spans.clear();
+            self.syntax_task = None;
+        }
+        // Only fenced code is highlighted, so prose has no spans to compute.
+        // Skipping the parse round trip avoids a second full frame and a
+        // re-measure of the whole draft after every keystroke.
+        if self.mentions_enabled
+            && self.syntax_task.is_none()
+            && self.syntax_spans.is_empty()
+            && composer_markdown::may_contain_fence(&self.syntax_source)
+        {
             let source = self.syntax_source.clone();
             // Keep grammar loading and parsing off the input/paint thread. A
             // dropped task and source check prevent stale edits recoloring text.
@@ -4485,7 +4495,7 @@ impl Render for ComposerInput {
                     .await;
                 input
                     .update(cx, |input, cx| {
-                        if input.content == source {
+                        if input.content == source && input.syntax_spans != spans {
                             input.syntax_spans = spans;
                             input.needs_measure = true;
                             cx.notify();

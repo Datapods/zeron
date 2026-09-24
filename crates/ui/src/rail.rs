@@ -7,7 +7,9 @@
 //! in free functions with unit tests; rendering is an `impl Transcript`
 //! extension since the rail shares the transcript's rows and `ListState`.
 
-use gpui::{AnyElement, Context, ListOffset, SharedString, div, prelude::*, px};
+use gpui::{AnyElement, App, Context, ListOffset, SharedString, div, prelude::*, px};
+use std::collections::HashMap;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use zeron_doc::{MessagePart, MessageRole, SessionMessageEntry};
@@ -53,14 +55,14 @@ fn user_text(entry: &SessionMessageEntry) -> String {
     crate::attachments::user_message_rail_text(&raw)
 }
 
-fn first_reply_text(entries: &[SessionMessageEntry]) -> Option<String> {
+fn first_reply_preview(entries: &[SessionMessageEntry]) -> Option<String> {
     entries
         .iter()
         .find(|e| e.role == MessageRole::Assistant)
         .and_then(|entry| {
             entry.parts.iter().find_map(|part| match part {
                 MessagePart::Text { text, .. } if !text.trim().is_empty() => {
-                    Some(text.trim().to_string())
+                    Some(truncate_preview(text, PREVIEW_REPLY_CHARS))
                 }
                 _ => None,
             })
@@ -70,7 +72,7 @@ fn first_reply_text(entries: &[SessionMessageEntry]) -> Option<String> {
 /// Extract rail ticks from the transcript: one per user entry (doc entries
 /// first, then unconfirmed echoes — matching transcript row order). Each tick
 /// carries the opening of the assistant reply that followed it, for the hover
-/// preview card.
+/// preview card. Prompt and reply are already capped preview text.
 pub fn rail_ticks(
     entries: &[SessionMessageEntry],
     echoes: &[SessionMessageEntry],
@@ -82,15 +84,15 @@ pub fn rail_ticks(
         }
         ticks.push(RailTick {
             message_id: entry.id.clone(),
-            prompt: user_text(entry),
-            reply: first_reply_text(&entries[ix + 1..]),
+            prompt: truncate_preview(&user_text(entry), PREVIEW_PROMPT_CHARS),
+            reply: first_reply_preview(&entries[ix + 1..]),
         });
     }
     for echo in echoes {
         if echo.role == MessageRole::User && !ticks.iter().any(|t| t.message_id == echo.id) {
             ticks.push(RailTick {
                 message_id: echo.id.clone(),
-                prompt: user_text(echo),
+                prompt: truncate_preview(&user_text(echo), PREVIEW_PROMPT_CHARS),
                 reply: None,
             });
         }
@@ -162,9 +164,25 @@ pub fn bucket_of(buckets: &[(usize, usize)], ix: usize) -> Option<usize> {
 /// Char-cap a preview with an ellipsis. Whitespace runs (including newlines —
 /// prompts and replies are free text) collapse to single spaces first: the
 /// preview card's title is a one-line surface (message-rail.tsx line-clamp-1).
+/// Stops reading once the cap is exceeded: replies run to tens of kilobytes and
+/// the rail rebuilds ticks whenever the transcript changes.
 pub fn truncate_preview(text: &str, max_chars: usize) -> String {
-    let flat = crate::transcript::single_line(text);
-    if flat.chars().count() <= max_chars {
+    let mut flat = String::new();
+    let mut chars = 0;
+    'words: for word in text.split_whitespace() {
+        if !flat.is_empty() {
+            flat.push(' ');
+            chars += 1;
+        }
+        for c in word.chars() {
+            if chars > max_chars {
+                break 'words;
+            }
+            flat.push(c);
+            chars += 1;
+        }
+    }
+    if chars <= max_chars {
         return flat;
     }
     let cut: String = flat.chars().take(max_chars.saturating_sub(1)).collect();
@@ -407,27 +425,48 @@ impl Transcript {
         }));
     }
 
+    /// Ticks mapped to their transcript rows (user rows share the entry id).
+    /// Every transcript render needs these, and most renders (typing, caret,
+    /// hover) change neither the transcript nor the rows.
+    fn rail_pairs(&mut self, cx: &App) -> Rc<Vec<(RailTick, usize)>> {
+        let state_entity = self.state_entity().clone();
+        let state = state_entity.read(cx);
+        let key = (
+            state.selected_chat.clone(),
+            state.transcript_revision,
+            self.rows_generation,
+        );
+        if let Some((cached_key, pairs)) = &self.rail_pairs_cache
+            && *cached_key == key
+        {
+            return pairs.clone();
+        }
+        let ticks = rail_ticks(&state.transcript, state.pending_echoes());
+        let row_of: HashMap<&str, usize> = self
+            .rows()
+            .iter()
+            .enumerate()
+            .map(|(ix, row)| (row.id.as_ref(), ix))
+            .collect();
+        let pairs: Rc<Vec<(RailTick, usize)>> = Rc::new(
+            ticks
+                .into_iter()
+                .filter_map(|tick| {
+                    let row = *row_of.get(tick.message_id.as_str())?;
+                    Some((tick, row))
+                })
+                .collect(),
+        );
+        self.rail_pairs_cache = Some((key, pairs.clone()));
+        pairs
+    }
+
     /// The rail element — an absolute overlay along the transcript's left edge.
     pub fn render_rail(&mut self, cx: &mut Context<Self>) -> AnyElement {
         if !self.rail_enabled() {
             return gpui::Empty.into_any_element();
         }
-        let (entries, echoes) = {
-            let state = self.state_entity().read(cx);
-            (state.transcript.clone(), state.pending_echoes().to_vec())
-        };
-        let ticks = rail_ticks(&entries, &echoes);
-        // Map each tick to its transcript row (user rows share the entry id).
-        let pairs: Vec<(RailTick, usize)> = ticks
-            .into_iter()
-            .filter_map(|tick| {
-                let row = self
-                    .rows()
-                    .iter()
-                    .position(|r| r.id.as_ref() == tick.message_id.as_str())?;
-                Some((tick, row))
-            })
-            .collect();
+        let pairs = self.rail_pairs(cx);
         // A minimap of one exchange is noise, not navigation — the original
         // rail hides below two marks (message-rail.tsx `marks.length < 2`).
         if pairs.len() < 2 {
@@ -497,11 +536,8 @@ impl Transcript {
                 } else {
                     crate::theme::ink(0.16)
                 };
-                let prompt = truncate_preview(&tick.prompt, PREVIEW_PROMPT_CHARS);
-                let reply = tick
-                    .reply
-                    .as_deref()
-                    .map(|r| truncate_preview(r, PREVIEW_REPLY_CHARS));
+                let prompt = tick.prompt;
+                let reply = tick.reply;
                 let card: Option<AnyElement> = is_hovered.then(|| {
                     let theme = theme.for_popup();
                     let card = popover::popover_card(&theme)
@@ -787,6 +823,26 @@ mod tests {
         // And the ease-in-out midpoint is exactly half the distance.
         let mid = spec.curve.eval(0.5);
         assert!((mid - 0.5).abs() < 0.01);
+    }
+
+    /// The early-exit cut must match flattening the whole text, then cutting.
+    #[test]
+    fn preview_truncation_matches_full_flatten() {
+        let reference = |text: &str, max: usize| {
+            let flat = crate::transcript::single_line(text);
+            if flat.chars().count() <= max {
+                return flat;
+            }
+            let cut: String = flat.chars().take(max.saturating_sub(1)).collect();
+            format!("{}…", cut.trim_end())
+        };
+        let long = "word ".repeat(100);
+        let texts = ["", "  a  b ", "exactly ten", "ünï cödé\n\tlines  here", long.as_str()];
+        for text in texts {
+            for max in [0, 1, 5, 10, 11, 12, 200] {
+                assert_eq!(truncate_preview(text, max), reference(text, max), "{text:?} {max}");
+            }
+        }
     }
 
     #[test]
