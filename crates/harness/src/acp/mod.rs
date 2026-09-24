@@ -616,6 +616,22 @@ fn configured_auth_method_in(path: &Path) -> Result<Option<ConfiguredAuthMethod>
         .map(ConfiguredAuthMethod::new))
 }
 
+/// Antigravity's `GEMINI_HOME`, resolved exactly as a launch resolves it —
+/// the directory whose `antigravity-acp/` holds its settings and tokens.
+pub fn antigravity_home() -> Result<PathBuf, HarnessError> {
+    antigravity_paths::home()
+}
+
+/// The auth method Antigravity's server saved in `settings.json` (it records
+/// every successful `authenticate`), canonicalized the way sign-in reads it.
+/// `None` when nothing is saved or the file can't be read.
+pub fn antigravity_saved_auth_method(home: &Path) -> Option<String> {
+    configured_auth_method_in(&home.join("antigravity-acp").join("settings.json"))
+        .ok()
+        .flatten()
+        .map(|method| method.canonical)
+}
+
 fn sign_in_auth_method(
     initialized: &Value,
     default_method: &str,
@@ -2558,6 +2574,14 @@ fn handle_server_request_live(
     Vec::new()
 }
 
+/// Where an agent that signs in from settings sends a signed-out run: the
+/// provider's Accounts section, whose connect flow is the same for every agent.
+fn not_signed_in(agent_name: &str) -> String {
+    format!(
+        "{agent_name} isn't signed in. Open Settings → Providers → {agent_name} and connect an account."
+    )
+}
+
 /// `session/new`. Agents that sign in from Settings never start a browser
 /// sign-in mid-chat; an auth_required answer points the user there instead.
 async fn new_session(
@@ -2569,9 +2593,7 @@ async fn new_session(
 ) -> Result<Value, HarnessError> {
     match request_draining(client, incoming, "session/new", params).await {
         Err(error) if signs_in_from_settings && is_auth_required(&error) => {
-            Err(HarnessError::Protocol(format!(
-                "{agent_name} isn't signed in. Use Settings → Agents → Sign in."
-            )))
+            Err(HarnessError::Protocol(not_signed_in(agent_name)))
         }
         other => other,
     }
@@ -2910,9 +2932,7 @@ async fn run_session(session: Session) {
             match request_draining(&client, &mut incoming, "session/load", load).await {
                 Ok(resp) => (resume.clone(), resp),
                 Err(e) if auth_method.is_some() && is_auth_required(&e) => {
-                    return Err(HarnessError::Protocol(format!(
-                        "{agent_name} isn't signed in. Use Settings → Agents → Sign in."
-                    )));
+                    return Err(HarnessError::Protocol(not_signed_in(agent_name)));
                 }
                 // A missing/foreign session falls back to a fresh one.
                 Err(e) => {
@@ -3391,7 +3411,7 @@ async fn run_session(session: Session) {
                 }
                 let (status, mut error) = stop_outcome(&res, interrupted);
                 if !interrupted && auth_method.is_some() && res.as_ref().is_err_and(is_auth_required) {
-                    error = Some(format!("{agent_name} isn't signed in. Use Settings → Agents → Sign in."));
+                    error = Some(not_signed_in(agent_name));
                 }
                 done_current = true;
                 if interrupted {

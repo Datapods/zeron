@@ -25,6 +25,7 @@ pub mod files;
 pub mod harnesses;
 pub mod notifications;
 pub mod shortcuts;
+pub mod thread_naming;
 pub mod widgets;
 
 /// Sidebar drag-resize bounds (px).
@@ -634,11 +635,12 @@ pub struct SkillCompletionSettings {
 }
 
 impl SkillCompletionSettings {
-    pub fn for_harness(harness: zeron_proto::HarnessId) -> Self {
-        let native_dollar = harness == zeron_proto::HarnessId::Codex;
+    /// Every harness defaults to `$` skills kept out of the `/` menu; an
+    /// explicit per-harness choice (or the legacy slash-menu flag) wins.
+    pub fn for_harness(_harness: zeron_proto::HarnessId) -> Self {
         Self {
-            dollar: native_dollar,
-            separate_from_slash: native_dollar,
+            dollar: true,
+            separate_from_slash: true,
         }
     }
 }
@@ -1622,13 +1624,13 @@ mod tests {
         let mut settings = UiSettings::default();
         for (harness, _) in SKILL_COMPLETION_HARNESSES {
             let preferences = settings.skill_completion(harness);
-            assert_eq!(preferences.dollar, harness == HarnessId::Codex);
-            assert_eq!(preferences.separate_from_slash, harness == HarnessId::Codex);
+            assert!(preferences.dollar);
+            assert!(preferences.separate_from_slash);
         }
         settings.skill_completion_by_harness.insert(
             HarnessId::ClaudeCode,
             SkillCompletionSettings {
-                dollar: true,
+                dollar: false,
                 separate_from_slash: true,
             },
         );
@@ -1645,8 +1647,8 @@ mod tests {
             settings.skill_completion_by_harness,
             loaded.skill_completion_by_harness
         );
-        assert!(loaded.skill_completion(HarnessId::ClaudeCode).dollar);
-        assert!(!loaded.skill_completion(HarnessId::Cursor).dollar);
+        assert!(!loaded.skill_completion(HarnessId::ClaudeCode).dollar);
+        assert!(loaded.skill_completion(HarnessId::Cursor).dollar);
         let legacy: UiSettings = serde_json::from_str(r#"{"skillsInSlashMenu":true}"#).unwrap();
         assert!(
             !legacy

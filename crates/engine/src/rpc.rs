@@ -376,6 +376,11 @@ struct AgentAccountParams {
 #[serde(rename_all = "camelCase")]
 struct StartAgentLoginParams {
     harness: HarnessId,
+    /// Stamped by the requesting engine when it forwards the start: the
+    /// device whose browser finishes the sign-in. The login's callback port
+    /// is served over P2P to that device alone.
+    #[serde(default)]
+    requester_device_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -796,6 +801,122 @@ impl EngineRpc {
         paths
     }
 
+    /// An agent login runs on `target`, but the browser that finishes it runs
+    /// HERE: while the login waits on a loopback callback, this device's same
+    /// port forwards to it over P2P ([`zeron_preview::login`]). The forwarder
+    /// opens when a reply first names the port and closes when the login
+    /// finishes, fails, is cancelled or its time runs out; a port taken here
+    /// fails the login with that reason instead of stranding the browser.
+    async fn forward_agent_login(
+        &self,
+        target: &str,
+        method: &str,
+        mut params: serde_json::Value,
+    ) -> Result<RpcReply, RpcError> {
+        use zeron_proto::{AgentLoginPoll, AgentLoginStart, AgentLoginStatus};
+        let login_id = params
+            .get("loginId")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        if method == methods::START_AGENT_LOGIN
+            && let Some(object) = params.as_object_mut()
+        {
+            object.insert(
+                "requesterDeviceId".into(),
+                serde_json::json!(self.doc_host.device_id()),
+            );
+        }
+        let reply = self.forward(target, method, params).await;
+        let Some(previews) = &self.previews else {
+            return reply;
+        };
+        let value = match &reply {
+            Ok(RpcReply::Value(value)) => Some(value.clone()),
+            _ => None,
+        };
+        match method {
+            methods::START_AGENT_LOGIN => {
+                let Some(start) =
+                    value.and_then(|v| serde_json::from_value::<AgentLoginStart>(v).ok())
+                else {
+                    return reply;
+                };
+                if let Some(port) = start.callback_port
+                    && let Err(error) = if crate::agent_accounts::tunnel_port_allowed(
+                        port,
+                        Some(start.url.as_str()),
+                    ) {
+                        previews
+                            .open_login_tunnel(&start.login_id, target, port, LOGIN_TUNNEL_TTL)
+                            .await
+                    } else {
+                        Err(anyhow::anyhow!(
+                            "The other device reported an unexpected sign-in port."
+                        ))
+                    }
+                {
+                    self.cancel_remote_login(target, &start.login_id).await;
+                    return Err(RpcError::Failed(error.to_string()));
+                }
+                reply
+            }
+            methods::POLL_AGENT_LOGIN => {
+                let Some(login_id) = login_id else {
+                    return reply;
+                };
+                let poll = value.and_then(|v| serde_json::from_value::<AgentLoginPoll>(v).ok());
+                match poll {
+                    Some(poll) if poll.status == AgentLoginStatus::Pending => {
+                        if let Some(port) = poll.callback_port
+                            && let Err(error) = if crate::agent_accounts::tunnel_port_allowed(
+                                port,
+                                poll.url.as_deref(),
+                            ) {
+                                previews
+                                    .open_login_tunnel(&login_id, target, port, LOGIN_TUNNEL_TTL)
+                                    .await
+                            } else {
+                                Err(anyhow::anyhow!(
+                                    "The other device reported an unexpected sign-in port."
+                                ))
+                            }
+                        {
+                            self.cancel_remote_login(target, &login_id).await;
+                            return RpcReply::value(&AgentLoginPoll {
+                                status: AgentLoginStatus::Error,
+                                message: Some(error.to_string()),
+                                url: None,
+                                callback_port: None,
+                            });
+                        }
+                        reply
+                    }
+                    // Done, failed, expired, or unreachable: the login is over.
+                    _ => {
+                        previews.close_login_tunnel(&login_id);
+                        reply
+                    }
+                }
+            }
+            _ => {
+                if let Some(login_id) = login_id {
+                    previews.close_login_tunnel(&login_id);
+                }
+                reply
+            }
+        }
+    }
+
+    async fn cancel_remote_login(&self, target: &str, login_id: &str) {
+        let params = serde_json::json!({ "loginId": login_id, "targetDeviceId": target });
+        if let Err(error) = self
+            .forward(target, methods::CANCEL_AGENT_LOGIN, params)
+            .await
+        {
+            tracing::debug!(%error, "cancelling the remote login failed (best-effort)");
+        }
+    }
+
     /// Forward a device-addressed call over the target device's relay. On transport
     /// failure the cached link is invalidated so the next call re-dials.
     async fn forward(
@@ -1104,6 +1225,10 @@ fn forward_deadline(method: &str) -> std::time::Duration {
         _ => Duration::from_secs(30),
     }
 }
+
+/// How long this device forwards a remote login's callback at most — the
+/// running engine reaps an abandoned login after the same 15 minutes.
+const LOGIN_TUNNEL_TTL: Duration = Duration::from_secs(15 * 60);
 
 /// ControlRpc methods that honor `targetDeviceId` (feature-inventory §2.1). Extend this
 /// list (plus [`is_stream_method`] for streams) to make more of the surface
@@ -1455,6 +1580,15 @@ impl RpcService for EngineRpc {
             && target != self.doc_host.device_id()
         {
             let target = target.to_string();
+            if matches!(
+                method,
+                methods::START_AGENT_LOGIN
+                    | methods::POLL_AGENT_LOGIN
+                    | methods::COMPLETE_AGENT_LOGIN
+                    | methods::CANCEL_AGENT_LOGIN
+            ) {
+                return self.forward_agent_login(&target, method, params).await;
+            }
             return self.forward(&target, method, params).await;
         }
         if AuthRpc::handles(method) {
@@ -2775,9 +2909,17 @@ impl RpcService for EngineRpc {
             }
             methods::START_AGENT_LOGIN => {
                 let p: StartAgentLoginParams = parse_params(params)?;
+                // A requester naming this device is no remote login at all:
+                // publishing a callback route for ourselves would be a no-op
+                // at best, so never register one.
+                let own_id = self.doc_host.device_id();
+                let requester = p
+                    .requester_device_id
+                    .as_deref()
+                    .filter(|requester| !requester.is_empty() && *requester != own_id);
                 let start = self
                     .agent_accounts
-                    .start_login(p.harness)
+                    .start_login_for(p.harness, requester)
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&start)

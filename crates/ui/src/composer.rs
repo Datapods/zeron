@@ -9254,16 +9254,7 @@ impl Render for Composer {
         let appshot_strip = self.render_appshot_strip(&theme, window, cx);
         let comments_chip = self.render_comments_chip(&theme, cx);
 
-        // A translucent cool silver/slate edge sits more naturally on frost
-        // than the general-purpose white/black separator color.
-        let pill_border = if theme.is_frost() {
-            match theme.appearance {
-                crate::theme::Appearance::Dark => gpui::hsla(210.0 / 360.0, 0.18, 0.78, 0.09),
-                crate::theme::Appearance::Light => gpui::hsla(210.0 / 360.0, 0.18, 0.32, 0.10),
-            }
-        } else {
-            theme.border
-        };
+        let pill_border = theme.composer_surface_border();
         // Compensate for the transcript canvas beneath the frosted surface.
         // Keep the opaque fallback when frost is disabled or unsupported.
         let pill = div()
@@ -9280,10 +9271,8 @@ impl Render for Composer {
             .rounded(px(surface_radius))
             .border_1()
             .border_color(pill_border)
-            .when(theme.is_frost(), |el| el.bg(theme.composer_sidebar_tint()))
-            .when(!theme.is_frost(), |el| {
-                el.bg(theme.input_glass_bg()).shadow_lg()
-            });
+            .bg(theme.composer_surface_bg())
+            .when(!theme.is_frost(), |el| el.shadow_lg());
         // The pill's bottom edge is stationary on screen (the composer sits at
         // the bottom of the shell column; growth moves the TOP edge), so the
         // controls pin to the bottom and only the text glides with the reveal
