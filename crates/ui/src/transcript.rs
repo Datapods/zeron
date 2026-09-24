@@ -8314,6 +8314,41 @@ fn subagent_tab_title(call: &ToolCall) -> SharedString {
     "Subagent".into()
 }
 
+/// A spawned subagent that is still working, for the strip above the composer.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RunningSubagent {
+    pub doc_id: String,
+    pub title: SharedString,
+    pub tail: Option<SharedString>,
+}
+
+/// Running subagents in transcript order, read from the same parts as the
+/// spawn chips so the strip and the chips always agree.
+pub(crate) fn running_subagents(entries: &[SessionMessageEntry]) -> Vec<RunningSubagent> {
+    entries
+        .iter()
+        .flat_map(|entry| &entry.parts)
+        .filter_map(|part| match part {
+            MessagePart::Tool {
+                call,
+                subagent_ref: Some(doc_id),
+                subagent_status: Some(SubagentStatus::Running),
+                subagent_tail,
+                ..
+            } if is_agent_call(call) => Some(RunningSubagent {
+                doc_id: doc_id.clone(),
+                title: subagent_tab_title(call),
+                tail: subagent_tail
+                    .as_deref()
+                    .map(single_line)
+                    .filter(|tail| !tail.is_empty())
+                    .map(SharedString::from),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Clip one newly appended task row to its committed height. Fade and lift are
 /// applied to the row content itself, leaving the connector at full contrast
 /// while it draws; fading the whole row made the path animation imperceptible.
@@ -13516,6 +13551,48 @@ mod tests {
             .as_ref(),
             "Subagent"
         );
+    }
+
+    #[test]
+    fn running_subagents_lists_only_live_spawns() {
+        let spawn = |id: &str, name: &str, doc: Option<&str>, status| MessagePart::Tool {
+            id: id.into(),
+            call: ToolCall::Unknown {
+                name: name.into(),
+                input: None,
+            },
+            is_error: false,
+            resolved: true,
+            output: None,
+            diff: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            diff_stats: None,
+            subagent_ref: doc.map(str::to_owned),
+            subagent_status: status,
+            subagent_tail: Some("  reading\n files ".into()),
+        };
+        let entry = SessionMessageEntry {
+            id: "a".into(),
+            role: MessageRole::Assistant,
+            parts: vec![
+                spawn("1", "Agent: scan repo", Some("doc-1"), Some(SubagentStatus::Running)),
+                spawn("2", "Agent: done task", Some("doc-2"), Some(SubagentStatus::Done)),
+                spawn("3", "Agent: no ref", None, Some(SubagentStatus::Running)),
+                spawn("4", "Bash", Some("doc-4"), Some(SubagentStatus::Running)),
+            ],
+            created_at: 0,
+            device_id: "local".into(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+            duration_ms: None,
+        };
+        let running = running_subagents(&[entry]);
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].doc_id, "doc-1");
+        assert_eq!(running[0].title.as_ref(), "scan repo");
+        assert_eq!(running[0].tail.as_ref().map(|t| t.as_ref()), Some("reading files"));
     }
 
     #[test]

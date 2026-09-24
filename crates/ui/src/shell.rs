@@ -66,6 +66,7 @@ mod project_icon;
 mod sidebar_pins;
 mod sidebar_sections;
 mod spaces;
+mod subagent_strip;
 mod tabs;
 
 use spaces::{AddSpaceFlow, RenameSpaceDialog};
@@ -1551,6 +1552,7 @@ enum PendingExit {
 pub struct Shell {
     state: Entity<AppState>,
     sidebar_pane: Entity<SidebarPane>,
+    subagent_strip: Entity<subagent_strip::SubagentStrip>,
     transcript: Entity<Transcript>,
     composer: Entity<Composer>,
     /// Measured height of the bottom chrome stack (status strip + composer +
@@ -2002,9 +2004,12 @@ impl Shell {
             shell: shell.downgrade(),
             _observation: cx.observe(&shell, |_, _, cx| cx.notify()),
         });
+        let subagent_strip =
+            cx.new(|cx| subagent_strip::SubagentStrip::new(shell.downgrade(), state.clone(), cx));
         Self {
             state,
             sidebar_pane,
+            subagent_strip,
             transcript,
             composer,
             // Seed with the compact composer stack's rough height so the
@@ -8750,6 +8755,8 @@ impl Shell {
         };
 
         let status = self.render_status_strip(composer_width, cx);
+        self.subagent_strip
+            .update(cx, |strip, cx| strip.set_width(composer_width, cx));
         // Attachment dropzone over the ENTIRE conversation column (transcript
         // + composer, not just the pill). OS images keep using the upload
         // pipeline; workspace files/directories and file tabs become the same
@@ -8871,6 +8878,7 @@ impl Shell {
                         .absolute()
                         .inset_0(),
                     )
+                    .child(self.subagent_strip.clone())
                     .child(status)
                     .when(has_spaces || no_project || has_appshots, |el| {
                         let composer_opacity = self.composer_dock.borrow().opacity();
