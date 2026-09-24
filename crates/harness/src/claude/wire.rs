@@ -270,6 +270,14 @@ pub(crate) fn allow_response(updated_input: Value) -> Value {
     json!({ "behavior": "allow", "updatedInput": updated_input })
 }
 
+/// `can_use_tool` deny payload; the message is what the model sees.
+pub(crate) fn deny_response(tool_name: &str) -> Value {
+    json!({
+        "behavior": "deny",
+        "message": format!("Permission to use {tool_name} was denied by auto mode."),
+    })
+}
+
 /// Client→CLI interrupt control request.
 pub(crate) fn interrupt_request_line(request_id: &str) -> String {
     json!({

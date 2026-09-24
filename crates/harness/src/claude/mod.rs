@@ -56,7 +56,7 @@ use crate::process::{Child, ChildStdin, Command, Stdio};
 use crate::{Harness, HarnessError, RunControls, Signal, send_signal, shutdown_child};
 use catalog::{apply_ultrathink, to_effort};
 use normalize::Normalizer;
-use wire::{ControlRequestFrame, Frame, allow_response, control_response_line};
+use wire::{ControlRequestFrame, Frame, allow_response, control_response_line, deny_response};
 
 /// Locate the device's installed Claude Code CLI: our own PATH, then the
 /// login-shell PATH snapshot (the user's shell init shapes PATH in ways a
@@ -170,6 +170,9 @@ impl ClaudeHarness {
             // Undocumented flag; validated live against 2.1.228.
             "--permission-prompt-tool",
             "stdio",
+            // Headless runs skip Claude in Chrome even when the user's config
+            // enables it by default; only the explicit flag loads the browser tools.
+            "--chrome",
         ]);
         // The 1M context window is selected via a model-id suffix
         // (`sonnet[1m]`), exactly how the CLI itself does it; fast mode and
@@ -197,7 +200,7 @@ impl ClaudeHarness {
                 "--dangerously-skip-permissions",
             ]);
         } else {
-            cmd.args(["--permission-mode", "default"]);
+            cmd.args(["--permission-mode", "auto"]);
         }
         if let Some(resume) = &request.resume {
             cmd.arg(format!("--resume={resume}"));
@@ -861,9 +864,12 @@ type RequestInputFn = Box<
         + Sync,
 >;
 
-/// Serve one `can_use_tool` control request. Every tool is auto-approved
-/// (unattended parity — the CLI still blocks until SOME response arrives, so
-/// every request must be answered); `AskUserQuestion` is intercepted —
+/// Serve one `can_use_tool` control request. Runs are in auto mode, so a
+/// request reaching us is one the classifier would not approve on its own:
+/// deny it rather than let the harness become a blanket approver (the CLI
+/// still blocks until SOME response arrives, so every request must be
+/// answered). `ExitPlanMode` is allowed so plan mode can't wedge a run;
+/// `AskUserQuestion` is intercepted —
 /// surface the questions through the engine's input bridge (which owns the
 /// `InputRequested`/`InputResolved` lifecycle), wait for the user's answers
 /// (in a subtask so the frame loop keeps flowing), and hand them back keyed
@@ -881,7 +887,12 @@ fn handle_control_request(
         return;
     }
     if req.request.tool_name != "AskUserQuestion" {
-        let line = control_response_line(&req.request_id, allow_response(req.request.input));
+        let response = if req.request.tool_name == "ExitPlanMode" {
+            allow_response(req.request.input)
+        } else {
+            deny_response(&req.request.tool_name)
+        };
+        let line = control_response_line(&req.request_id, response);
         let _ = stdin_tx.send(StdinMsg::Line(line));
         return;
     }

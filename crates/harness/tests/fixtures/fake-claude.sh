@@ -83,13 +83,13 @@ case "$first" in
 
 *scenario:askuser*)
   emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":["Bash"],"cwd":"/tmp","session_id":"sess-ask"}'
-  # A plain tool permission request: must be auto-allowed.
+  # A plain tool permission request: auto mode already passed on it, so it must be denied.
   emit '{"type":"control_request","request_id":"cr-0","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"}}}'
   read -r resp0 || exit 1
   case "$resp0" in
-  *'"request_id":"cr-0"'*'"behavior":"allow"'*) ;;
+  *'"request_id":"cr-0"'*'"behavior":"deny"'*) ;;
   *)
-    emit '{"type":"result","subtype":"error_during_execution","errors":["bash tool was not allowed"],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-ask"}'
+    emit '{"type":"result","subtype":"error_during_execution","errors":["bash tool was not denied"],"usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-ask"}'
     exit 0
     ;;
   esac

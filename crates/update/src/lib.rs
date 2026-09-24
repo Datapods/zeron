@@ -256,7 +256,8 @@ pub enum InstallKind {
 impl InstallKind {
     pub fn supports_desktop_update(&self) -> bool {
         match self {
-            Self::MacApp { .. } => true,
+            // Datapods fork: upstream's bundle would silently replace this build.
+            Self::MacApp { .. } => false,
             #[cfg(windows)]
             Self::WindowsPortable { .. } => true,
             _ => false,

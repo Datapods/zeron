@@ -321,7 +321,7 @@ async fn ask_user_question_round_trips_through_the_control_channel() {
     );
 
     // "answered" proves both control round-trips: the plain Bash can_use_tool
-    // was auto-allowed AND the answers reached the CLI as updatedInput.answers
+    // was denied AND the answers reached the CLI as updatedInput.answers
     // keyed by question text.
     assert_eq!(
         events.last(),
