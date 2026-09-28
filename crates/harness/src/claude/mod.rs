@@ -10,9 +10,9 @@
 //!   transport the Claude Agent SDK's `query()` drives, and was re-validated
 //!   live against 2.1.228: `can_use_tool` control requests arrive and
 //!   allow/deny responses are honored). The alternative channel — an MCP
-//!   permission tool — needs a server process and was rejected. Tool calls
-//!   auto-allow (zeron sessions run unattended, parity with the ACP
-//!   harness's preferred-allow behavior); `AskUserQuestion` round-trips
+//!   permission tool — needs a server process and was rejected. The chat's
+//!   `permissionMode` option picks auto mode (requests reaching us are
+//!   denied) or bypass (allowed); `AskUserQuestion` round-trips
 //!   through [`RunControls::request_input`].
 //! - DONE is the CLI's own `result` frame, eagerly: background work (a
 //!   spawned subagent) never holds the turn. The CLI natively runs a second
@@ -54,7 +54,7 @@ use zeron_proto::{
 
 use crate::process::{Child, ChildStdin, Command, Stdio};
 use crate::{Harness, HarnessError, RunControls, Signal, send_signal, shutdown_child};
-use catalog::{apply_ultrathink, to_effort};
+use catalog::{APPROVE_ALL, PERMISSION_MODE, apply_ultrathink, to_effort};
 use normalize::Normalizer;
 use wire::{ControlRequestFrame, Frame, allow_response, control_response_line, deny_response};
 
@@ -74,6 +74,15 @@ fn resolve_claude_executable() -> Option<PathBuf> {
     extra.push(PathBuf::from("/opt/homebrew/bin/claude"));
     extra.push(PathBuf::from("/usr/local/bin/claude"));
     crate::executable::find_on_paths("claude", extra)
+}
+
+/// The chat picked "Approve All" over auto mode.
+fn approves_all(request: &RunRequest) -> bool {
+    request
+        .model_options
+        .get(PERMISSION_MODE)
+        .and_then(Value::as_str)
+        == Some(APPROVE_ALL)
 }
 
 fn option_is_on(options: &serde_json::Map<String, Value>, key: &str) -> bool {
@@ -193,7 +202,7 @@ impl ClaudeHarness {
         if let Some(effort) = to_effort(request.reasoning, request.model.as_deref()) {
             cmd.args(["--effort", effort]);
         }
-        if request.auto_approve {
+        if request.auto_approve || approves_all(request) {
             cmd.args([
                 "--permission-mode",
                 "bypassPermissions",
@@ -569,6 +578,7 @@ impl ClaudeHarness {
         let (event_tx, event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
         tokio::spawn(run_session(Session {
             title_only,
+            approve_all: approves_all(&request),
             child,
             stdout_lines: BufReader::new(stdout).lines(),
             stdin_tx,
@@ -693,6 +703,7 @@ async fn stdin_writer(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<Std
 
 struct Session {
     title_only: bool,
+    approve_all: bool,
     child: Child,
     stdout_lines: tokio::io::Lines<BufReader<crate::process::ChildStdout>>,
     stdin_tx: mpsc::UnboundedSender<StdinMsg>,
@@ -710,6 +721,7 @@ struct Session {
 async fn run_session(session: Session) {
     let Session {
         title_only,
+        approve_all,
         mut child,
         mut stdout_lines,
         stdin_tx,
@@ -757,7 +769,7 @@ async fn run_session(session: Session) {
                             }));
                             let _ = stdin_tx.send(StdinMsg::Line(line));
                         } else {
-                            handle_control_request(req, &request_input, &stdin_tx);
+                            handle_control_request(req, approve_all, &request_input, &stdin_tx);
                         }
                         continue;
                     }
@@ -864,11 +876,12 @@ type RequestInputFn = Box<
         + Sync,
 >;
 
-/// Serve one `can_use_tool` control request. Runs are in auto mode, so a
-/// request reaching us is one the classifier would not approve on its own:
-/// deny it rather than let the harness become a blanket approver (the CLI
-/// still blocks until SOME response arrives, so every request must be
-/// answered). `ExitPlanMode` is allowed so plan mode can't wedge a run;
+/// Serve one `can_use_tool` control request. In auto mode a request reaching
+/// us is one the classifier would not approve on its own: deny it rather than
+/// let the harness become a blanket approver. With `approve_all` the user opted
+/// into exactly that, so anything that still reaches us under bypass mode is
+/// allowed. The CLI blocks until SOME response arrives, so every request must
+/// be answered. `ExitPlanMode` is allowed so plan mode can't wedge a run;
 /// `AskUserQuestion` is intercepted —
 /// surface the questions through the engine's input bridge (which owns the
 /// `InputRequested`/`InputResolved` lifecycle), wait for the user's answers
@@ -876,6 +889,7 @@ type RequestInputFn = Box<
 /// by question text, as the tool expects.
 fn handle_control_request(
     req: ControlRequestFrame,
+    approve_all: bool,
     request_input: &Arc<RequestInputFn>,
     stdin_tx: &mpsc::UnboundedSender<StdinMsg>,
 ) {
@@ -887,7 +901,7 @@ fn handle_control_request(
         return;
     }
     if req.request.tool_name != "AskUserQuestion" {
-        let response = if req.request.tool_name == "ExitPlanMode" {
+        let response = if approve_all || req.request.tool_name == "ExitPlanMode" {
             allow_response(req.request.input)
         } else {
             deny_response(&req.request.tool_name)

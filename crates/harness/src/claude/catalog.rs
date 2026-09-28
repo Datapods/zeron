@@ -104,6 +104,30 @@ pub(crate) fn context_window() -> ModelOption {
     }
 }
 
+/// Per-chat permission mode. Offered on every model so a chat can flip between
+/// the classifier and blanket approval mid-conversation; a change restarts the
+/// runtime with `--resume`, so it applies from the next turn.
+pub(crate) fn permission_mode() -> ModelOption {
+    ModelOption {
+        id: PERMISSION_MODE.into(),
+        label: "Permissions".into(),
+        choices: vec![
+            ModelOptionChoice {
+                id: "auto".into(),
+                label: "Auto".into(),
+            },
+            ModelOptionChoice {
+                id: APPROVE_ALL.into(),
+                label: "Approve All".into(),
+            },
+        ],
+        default_choice: "auto".into(),
+    }
+}
+
+pub(crate) const PERMISSION_MODE: &str = "permissionMode";
+pub(crate) const APPROVE_ALL: &str = "approveAll";
+
 const FULL_LADDER: &[ReasoningLevel] = &[
     ReasoningLevel::Low,
     ReasoningLevel::Medium,
@@ -137,7 +161,7 @@ fn model(
         label: label.into(),
         description: (!description.is_empty()).then(|| description.into()),
         reasoning_levels: ladder.to_vec(),
-        options,
+        options: options.into_iter().chain([permission_mode()]).collect(),
     }
 }
 
@@ -187,7 +211,7 @@ fn models_with_settings(path: &std::path::Path) -> Vec<Model> {
                 label: id.into(),
                 description: None,
                 reasoning_levels: FULL_LADDER.to_vec(),
-                options: vec![],
+                options: vec![permission_mode()],
             });
         }
     }
@@ -288,7 +312,7 @@ pub(super) fn with_discovered_models(
             label: text("displayName").unwrap_or(id).into(),
             description: text("description").map(str::to_owned),
             reasoning_levels: ladder,
-            options: vec![],
+            options: vec![permission_mode()],
         });
     }
     if !valid {
