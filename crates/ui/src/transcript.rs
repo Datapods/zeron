@@ -7756,6 +7756,9 @@ fn tool_icon_path(call: &ToolCall) -> &'static str {
         ToolCall::Glob { .. } => crate::icons::FOLDER_WITH_FILES,
         ToolCall::WebFetch { .. } | ToolCall::WebSearch { .. } => crate::icons::GLOBAL,
         ToolCall::Todo { .. } => crate::icons::CHECKLIST,
+        ToolCall::Unknown { name, .. } if name.starts_with("Workflow") && is_agent_call(call) => {
+            crate::icons::FILE_TREE
+        }
         call if is_agent_call(call) => crate::icons::BOT,
         ToolCall::Unknown { name, .. } if name == "Wait for agents" => crate::icons::BOT,
         ToolCall::Mcp { .. } | ToolCall::Unknown { .. } => crate::icons::WIDGET,
@@ -8268,12 +8271,12 @@ fn title_line(text: &str, max: usize) -> Option<String> {
     Some(out)
 }
 
-/// Drop a leading "Agent"/"Task" genus (with its `:` and spacing) from a
-/// spawn-title candidate. Only a real word boundary strips — "Taskmaster"
-/// keeps its name. A bare "Agent"/"Task" strips to "" (no context at all).
+/// Drop a leading "Agent"/"Task"/"Workflow" genus (with its `:` and spacing)
+/// from a spawn-title candidate. Only a real word boundary strips —
+/// "Taskmaster" keeps its name. A bare genus strips to "" (no context at all).
 fn strip_spawn_prefix(text: &str) -> &str {
     let t = text.trim();
-    for prefix in ["agent", "task"] {
+    for prefix in ["agent", "task", "workflow"] {
         if t.len() >= prefix.len()
             && t.is_char_boundary(prefix.len())
             && t[..prefix.len()].eq_ignore_ascii_case(prefix)

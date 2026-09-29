@@ -2693,3 +2693,145 @@ async fn real_image_generation_profile_smoke() {
     );
     core.sessions.shutdown().await;
 }
+
+/// A claude Workflow run: the workflow chip opens its own doc, and each
+/// workflow agent is a spawn chip INSIDE that doc with a transcript of its own.
+#[tokio::test]
+async fn nested_workflow_agents_stream_into_their_own_docs() {
+    fn tag(parent: &str, event: AgentEvent) -> AgentEvent {
+        AgentEvent::Subagent {
+            parent_tool_use_id: parent.into(),
+            event: Box::new(event),
+        }
+    }
+    let agent = |event| tag("wf", tag("wf-a1", event));
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(ScriptedHarness {
+            script: vec![
+                AgentEvent::ToolCall {
+                    id: "wf".into(),
+                    call: ToolCall::Unknown {
+                        name: "Workflow: review".into(),
+                        input: None,
+                    },
+                },
+                AgentEvent::ToolResult {
+                    id: "wf".into(),
+                    is_error: false,
+                    output: None,
+                    diff: None,
+                },
+                tag(
+                    "wf",
+                    AgentEvent::UserMessage {
+                        text: "Review the diff".into(),
+                    },
+                ),
+                tag(
+                    "wf",
+                    AgentEvent::TextDelta {
+                        text: "**Review**\n\n".into(),
+                    },
+                ),
+                tag(
+                    "wf",
+                    AgentEvent::ToolCall {
+                        id: "wf-a1".into(),
+                        call: ToolCall::Unknown {
+                            name: "Agent: bugs".into(),
+                            input: None,
+                        },
+                    },
+                ),
+                agent(AgentEvent::UserMessage {
+                    text: "Find bugs".into(),
+                }),
+                agent(AgentEvent::TextDelta {
+                    text: "found none".into(),
+                }),
+                done(DoneStatus::Completed),
+                tag(
+                    "wf",
+                    AgentEvent::ToolResult {
+                        id: "wf-a1".into(),
+                        is_error: false,
+                        output: None,
+                        diff: None,
+                    },
+                ),
+                agent(done(DoneStatus::Completed)),
+                // A straggler after the agent froze never reopens its doc.
+                agent(AgentEvent::TextDelta {
+                    text: "late".into(),
+                }),
+                tag("wf", done(DoneStatus::Completed)),
+            ],
+            step_delay: Duration::from_millis(10),
+            hang_until_interrupt: false,
+        }),
+    );
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "workflow-run",
+        SessionCommandPayload::Run {
+            request: run_request("run the review workflow"),
+            message_id: "workflow-user".into(),
+        },
+    );
+    let chip = |entries: Vec<SessionMessageEntry>, id: &str| {
+        entries
+            .into_iter()
+            .flat_map(|e| e.parts)
+            .find_map(|p| match p {
+                MessagePart::Tool {
+                    id: part_id,
+                    subagent_ref,
+                    subagent_status,
+                    ..
+                } if part_id == id => Some((subagent_ref, subagent_status)),
+                _ => None,
+            })
+    };
+    let wf_doc = format!("{CHAT}--sub--wf");
+    let agent_doc = format!("{CHAT}--sub--wf-a1");
+    wait_for(
+        || {
+            chip(entries(&core), "wf")
+                .is_some_and(|(_, s)| s == Some(zeron_doc::SubagentStatus::Done))
+        },
+        "workflow chip to settle",
+    )
+    .await;
+    assert_eq!(chip(entries(&core), "wf").unwrap().0, Some(wf_doc.clone()));
+
+    let workflow = entries_for(&core, &wf_doc);
+    assert_eq!(workflow[0].role, MessageRole::User);
+    assert!(
+        matches!(&workflow[0].parts[0], MessagePart::Text { text, .. } if text == "Review the diff")
+    );
+    assert!(
+        workflow[1]
+            .parts
+            .iter()
+            .any(|p| matches!(p, MessagePart::Text { text, .. } if text.contains("Review")))
+    );
+    assert_eq!(
+        chip(workflow, "wf-a1"),
+        Some((
+            Some(agent_doc.clone()),
+            Some(zeron_doc::SubagentStatus::Done)
+        ))
+    );
+
+    let transcript = entries_for(&core, &agent_doc);
+    assert_eq!(transcript.len(), 2, "{transcript:#?}");
+    assert!(
+        matches!(&transcript[0].parts[0], MessagePart::Text { text, .. } if text == "Find bugs")
+    );
+    assert!(
+        matches!(&transcript[1].parts[0], MessagePart::Text { text, .. } if text == "found none")
+    );
+}

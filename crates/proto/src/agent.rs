@@ -223,13 +223,19 @@ impl ToolCall {
     /// turn an ordinary Run/Read chip into a spawn chip (2026-08-20: claude's
     /// background-shell `task_notification` did exactly that — the chip
     /// linked to a never-created doc and opened an empty panel).
+    ///
+    /// A claude `Workflow` run (`Workflow[: <name>]`) is a spawn too: its doc
+    /// holds one nested spawn chip per workflow agent.
     pub fn is_subagent_spawn(&self) -> bool {
         let name = match self {
             ToolCall::Unknown { name, .. } => name,
             ToolCall::Mcp { tool, .. } => tool,
             _ => return false,
         };
-        name == "Agent" || name.starts_with("Agent: ")
+        ["Agent", "Workflow"].iter().any(|genus| {
+            name.strip_prefix(genus)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(": "))
+        })
     }
 
     /// The model a subagent SPAWN was given, when the spawn named one.

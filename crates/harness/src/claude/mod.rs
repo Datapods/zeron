@@ -35,6 +35,7 @@ pub mod catalog;
 mod discovery;
 mod normalize;
 mod wire;
+mod workflow;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -716,6 +717,9 @@ struct Session {
     stderr_tail: crate::StderrTail,
 }
 
+/// How often live Workflow transcript dirs are re-read.
+const WORKFLOW_POLL: Duration = Duration::from_millis(750);
+
 /// The per-run event loop: one task multiplexing stdout frames, the steering
 /// mailbox, the interrupt token, and consumer liveness.
 async fn run_session(session: Session) {
@@ -746,6 +750,11 @@ async fn run_session(session: Session) {
     let mut any_done = false;
     let mut done_after_interrupt = false;
     let mut escalation: Option<tokio::task::JoinHandle<()>> = None;
+    // Live Workflow runs, tailed from disk: their agents never stream on
+    // stdout (see [`workflow`]).
+    let mut workflows: Vec<workflow::WorkflowTail> = Vec::new();
+    let mut workflow_tick = tokio::time::interval(WORKFLOW_POLL);
+    workflow_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     'main: loop {
         tokio::select! {
@@ -773,7 +782,18 @@ async fn run_session(session: Session) {
                         }
                         continue;
                     }
-                    for ev in norm.normalize(frame, interrupted) {
+                    let mut events = norm.normalize(frame, interrupted);
+                    for (tool_id, dir) in norm.workflow_launches.drain(..) {
+                        let mut tail = workflow::WorkflowTail::new(tool_id, dir);
+                        events.extend(tail.poll());
+                        workflows.push(tail);
+                    }
+                    for (tool_id, status) in norm.workflow_finishes.drain(..) {
+                        if let Some(at) = workflows.iter().position(|w| w.tool_id == tool_id) {
+                            events.extend(workflows.swap_remove(at).finish(status));
+                        }
+                    }
+                    for ev in events {
                         let is_done = matches!(ev, AgentEvent::Done { .. });
                         if event_tx.send(Ok(ev)).await.is_err() {
                             break 'main; // consumer gone — reap below
@@ -832,6 +852,16 @@ async fn run_session(session: Session) {
                         tokio::time::sleep(kill_grace).await;
                         send_signal(&pid, Signal::Kill);
                     }));
+                }
+            },
+
+            _ = workflow_tick.tick(), if !workflows.is_empty() => {
+                for tail in &mut workflows {
+                    for ev in tail.poll() {
+                        if event_tx.send(Ok(ev)).await.is_err() {
+                            break 'main;
+                        }
+                    }
                 }
             },
 

@@ -1303,6 +1303,60 @@ impl SubagentSink {
     }
 }
 
+/// Open a subagent's transcript doc; `None` (logged) degrades to chip-only.
+fn open_subagent_sink(inner: &Inner, sub_id: &str) -> Option<SubagentSink> {
+    let doc = match inner.doc_host()?.open(sub_id) {
+        Ok(handle) => handle.doc_arc(),
+        Err(err) => {
+            tracing::warn!(doc = %sub_id, error = %err, "subagent doc open failed (chip-only)");
+            return None;
+        }
+    };
+    Some(SubagentSink {
+        doc_id: sub_id.to_owned(),
+        doc,
+        entry_id: new_id(),
+        started_at: now_ms(),
+        entry_index: None,
+        written: Vec::new(),
+        folded: Vec::new(),
+        dirty: false,
+    })
+}
+
+/// FREEZE a settled subagent: the finished transcript uploads as a static R2
+/// blob (`blob/{chatId}/{subDocId}`) so viewers of finished subagents never
+/// wake the doc's room; dropping the sink unpins the doc for the LRU and the
+/// room idles. The live doc remains the fallback.
+fn freeze_subagent_sink(
+    inner: &Inner,
+    chat_id: &str,
+    device_id: &str,
+    sink: SubagentSink,
+    done: &AgentEvent,
+) {
+    let status = match done {
+        AgentEvent::Done {
+            status: DoneStatus::Interrupted,
+            ..
+        } => MessageStatus::Aborted,
+        _ => MessageStatus::Complete,
+    };
+    let doc_id = sink.doc_id.clone();
+    if let Some(json) = sink.finish(device_id, status)
+        && let Some(host) = inner.doc_host()
+    {
+        host.upload_tool_sidecar(
+            chat_id,
+            zeron_doc::SidecarPayload {
+                part_id: doc_id,
+                output: Some(json),
+                diff: None,
+            },
+        );
+    }
+}
+
 /// The parent-chip refresh a tagged event implies, for the in-place (parked)
 /// path — LIFECYCLE ONLY, mirroring the fold (live tails were rejected:
 /// per-delta chip rewrites grew the parent doc for the whole run).
@@ -1863,6 +1917,75 @@ async fn drive_run(
             event
         };
 
+        // ── nested subagent routing ────────────────────────────────────
+        // A spawn inside a subagent's doc (a claude Workflow run's agents):
+        // the chip lives in the OUTER sink, so that sink carries its ref and
+        // lifecycle, and the leaf content streams into the chip's own doc.
+        if let AgentEvent::Subagent {
+            parent_tool_use_id: outer_id,
+            event: outer_event,
+        } = &event
+            && let AgentEvent::Subagent {
+                parent_tool_use_id: chip_id,
+                event: leaf,
+            } = outer_event.as_ref()
+        {
+            inner.publish(&chat_id, &event);
+            if !subagents.contains_key(outer_id) {
+                continue;
+            }
+            let is_steer = matches!(
+                leaf.as_ref(),
+                AgentEvent::UserMessage { .. } | AgentEvent::Steered { .. }
+            );
+            if is_steer {
+                settled_subagents.remove(chip_id);
+            } else if settled_subagents.contains(chip_id) && !subagents.contains_key(chip_id) {
+                continue;
+            }
+            let done = matches!(leaf.as_ref(), AgentEvent::Done { .. });
+            if !done
+                && !subagents.contains_key(chip_id)
+                && let Some(sink) = open_subagent_sink(&inner, &subagent_doc_id(&chat_id, chip_id))
+            {
+                let sub_id = sink.doc_id.clone();
+                subagents.insert(chip_id.clone(), sink);
+                let outer = subagents.get_mut(outer_id).expect("checked");
+                for p in outer.folded.iter_mut() {
+                    if let MessagePart::Tool {
+                        id,
+                        call,
+                        subagent_ref,
+                        ..
+                    } = p
+                        && id == chip_id
+                        && call.is_subagent_spawn()
+                    {
+                        *subagent_ref = Some(sub_id.clone());
+                    }
+                }
+            }
+            let outer = subagents.get_mut(outer_id).expect("checked");
+            zeron_doc::fold_event_into_parts(&mut outer.folded, outer_event);
+            outer.dirty = true;
+            if done {
+                settled_subagents.insert(chip_id.clone());
+            }
+            if let Some(sink) = subagents.get_mut(chip_id) {
+                if let AgentEvent::UserMessage { text } = leaf.as_ref() {
+                    sink.push_user(&device_id, text);
+                    continue;
+                }
+                zeron_doc::fold_event_into_parts(&mut sink.folded, leaf);
+                sink.dirty = true;
+                if done {
+                    let sink = subagents.remove(chip_id).expect("checked");
+                    freeze_subagent_sink(&inner, &chat_id, &device_id, sink, leaf);
+                }
+            }
+            continue;
+        }
+
         // ── subagent routing ───────────────────────────────────────────
         // Tagged events NEVER fold into the parent transcript: they stream
         // into the subagent's own doc, and the parent keeps only the spawn
@@ -1930,36 +2053,18 @@ async fn drive_run(
                 }
             }
             // Open the sink lazily; an open failure degrades to chip-only.
-            if !sink_known && !done_only {
-                let opened = inner.doc_host().and_then(|host| match host.open(&sub_id) {
-                    Ok(handle) => Some(handle.doc_arc()),
-                    Err(err) => {
-                        tracing::warn!(doc = %sub_id, error = %err, "subagent doc open failed (chip-only)");
-                        None
-                    }
-                });
-                if let Some(sub_doc) = opened {
-                    subagents.insert(
-                        parent_tool_use_id.clone(),
-                        SubagentSink {
-                            doc_id: sub_id.clone(),
-                            doc: sub_doc,
-                            entry_id: new_id(),
-                            started_at: now_ms(),
-                            entry_index: None,
-                            written: Vec::new(),
-                            folded: Vec::new(),
-                            dirty: false,
-                        },
+            if !sink_known
+                && !done_only
+                && let Some(sink) = open_subagent_sink(&inner, &sub_id)
+            {
+                subagents.insert(parent_tool_use_id.clone(), sink);
+                if !chip_streaming {
+                    let _ = doc_ref.update_subagent_chip(
+                        parent_tool_use_id,
+                        Some(&sub_id),
+                        Some("running"),
+                        None,
                     );
-                    if !chip_streaming {
-                        let _ = doc_ref.update_subagent_chip(
-                            parent_tool_use_id,
-                            Some(&sub_id),
-                            Some("running"),
-                            None,
-                        );
-                    }
                 }
             }
             let done = matches!(sub_event.as_ref(), AgentEvent::Done { .. });
@@ -1986,36 +2091,8 @@ async fn drive_run(
                     );
                 }
                 if done {
-                    let status = match sub_event.as_ref() {
-                        AgentEvent::Done {
-                            status: DoneStatus::Errored,
-                            ..
-                        } => MessageStatus::Complete,
-                        AgentEvent::Done {
-                            status: DoneStatus::Interrupted,
-                            ..
-                        } => MessageStatus::Aborted,
-                        _ => MessageStatus::Complete,
-                    };
                     let sink = subagents.remove(parent_tool_use_id).expect("checked");
-                    let doc_id = sink.doc_id.clone();
-                    // FREEZE: the finished transcript uploads as a static R2
-                    // blob (`blob/{chatId}/{subDocId}`) so viewers of
-                    // finished subagents never wake the doc's room; dropping
-                    // the sink unpins the doc for the LRU and the room
-                    // idles. The live doc remains the fallback.
-                    if let Some(json) = sink.finish(&device_id, status)
-                        && let Some(host) = inner.doc_host()
-                    {
-                        host.upload_tool_sidecar(
-                            &chat_id,
-                            zeron_doc::SidecarPayload {
-                                part_id: doc_id,
-                                output: Some(json),
-                                diff: None,
-                            },
-                        );
-                    }
+                    freeze_subagent_sink(&inner, &chat_id, &device_id, sink, sub_event);
                 }
             }
             continue;
