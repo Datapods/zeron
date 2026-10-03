@@ -249,6 +249,13 @@ impl WorkspaceHost {
         // Destructive-break hygiene: the pre-spaces row stays unreachable.
         store.delete_snapshot(LEGACY_WORKSPACE_DOC_ID).ok();
 
+        if config.edge.is_none() {
+            let folded = doc.set_local_only();
+            if folded > 0 {
+                tracing::info!(folded, "folded unackable registry batches into local rows");
+            }
+        }
+
         // Boot: upsert our own device row. A user-set name (RenameDevice is LWW from
         // any device) survives restarts. The old fallback sentinel is repaired with
         // the platform-resolved name because it was never a user-selected name.

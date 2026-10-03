@@ -375,6 +375,40 @@ fn rows_round_trip_and_upsert_refreshes() {
 }
 
 #[test]
+fn local_only_folds_the_backlog_into_the_same_view() {
+    // An edge-less replica never gets acks; its queue reached 123k batches
+    // and every read replayed all of them.
+    let mut doc = RegistryDoc::new("dev-a");
+    doc.upsert_chat(&chat("chat-1", "dev-a")).unwrap();
+    doc.upsert_chat(&chat("chat-2", "dev-a")).unwrap();
+    for status in [SessionStatus::Working, SessionStatus::Idle] {
+        doc.upsert_session(&session("chat-1", "dev-a", status))
+            .unwrap();
+    }
+    assert!(doc.rename_chat("chat-1", "renamed").unwrap());
+    assert!(doc.delete_chat("chat-2").unwrap());
+    let overlay = doc.read_all().unwrap();
+
+    assert!(doc.set_local_only() > 0);
+    assert_eq!(doc.pending_len(), 0);
+    let folded = doc.read_all().unwrap();
+    assert_eq!(folded.chats, overlay.chats);
+    assert_eq!(folded.sessions, overlay.sessions);
+
+    let reloaded = RegistryDoc::from_bytes(&doc.to_bytes().unwrap(), "dev-a").unwrap();
+    assert_eq!(reloaded.read_all().unwrap().chats, overlay.chats);
+
+    doc.upsert_session(&session("chat-1", "dev-a", SessionStatus::Working))
+        .unwrap();
+    assert_eq!(doc.pending_len(), 0, "later writes apply in place");
+    assert_eq!(
+        doc.read_sessions().unwrap(),
+        vec![session("chat-1", "dev-a", SessionStatus::Working)]
+    );
+    assert!(doc.take_pushable().is_empty());
+}
+
+#[test]
 fn own_push_ack_never_advances_the_cursor() {
     // Field incident: on the HTTPS transport, push ran before pull in one
     // cycle — the ack jumped the cursor to OUR batch's seq, and the pull

@@ -354,6 +354,10 @@ pub struct RegistryDoc {
     /// Bumped on every mutation (local or applied) — the engine host converts
     /// this into watch-channel publishes and snapshot debounces.
     generation: u64,
+    /// No edge room will ever ack this replica, so a pending batch could only
+    /// accumulate: every read replays the whole queue and every save
+    /// reserializes it.
+    local_only: bool,
 }
 
 impl RegistryDoc {
@@ -366,6 +370,31 @@ impl RegistryDoc {
             clock: HlcClock::default(),
             pending: Vec::new(),
             generation: 0,
+            local_only: false,
+        }
+    }
+
+    /// Apply local writes straight to the authoritative rows from now on, and
+    /// fold any queued batches into them. Returns the number of folded ops.
+    pub fn set_local_only(&mut self) -> usize {
+        self.local_only = true;
+        let pending = std::mem::take(&mut self.pending);
+        let ops: Vec<RowOp> = pending.into_iter().flat_map(|b| b.ops).collect();
+        let folded = ops.len();
+        if folded > 0 {
+            self.generation += 1;
+            for op in &ops {
+                self.apply_local(op);
+            }
+        }
+        folded
+    }
+
+    /// The same merge the edge room runs, applied in place.
+    fn apply_local(&mut self, op: &RowOp) {
+        let by_id = self.authoritative.entry(op.kind.clone()).or_default();
+        if let (Some(next), _) = apply_op(by_id.get(&op.id), op) {
+            by_id.insert(op.id.clone(), next);
         }
     }
 
@@ -604,6 +633,12 @@ impl RegistryDoc {
         // atomically (only cross-chunk atomicity is given up).
         const MAX_OPS_PER_BATCH: usize = 400;
         self.generation += 1;
+        if self.local_only {
+            for op in &ops {
+                self.apply_local(op);
+            }
+            return;
+        }
         while !ops.is_empty() {
             let tail = if ops.len() > MAX_OPS_PER_BATCH {
                 ops.split_off(MAX_OPS_PER_BATCH)
@@ -672,22 +707,35 @@ impl RegistryDoc {
         row.filter(|r| !r.deleted)
     }
 
-    /// All live rows of `kind`, overlay applied.
+    /// All live rows of `kind`, overlay applied. One pass over pending: a
+    /// per-row replay was O(rows × pending) and took most of a second on a
+    /// backlog of 100k batches.
     fn overlay_rows(&self, kind: &str) -> Vec<RegistryRow> {
-        let mut ids: Vec<String> = self
-            .authoritative
-            .get(kind)
-            .map(|m| m.keys().cloned().collect())
-            .unwrap_or_default();
+        let mut ids: Vec<String> = Vec::new();
+        let mut rows: HashMap<String, Option<RegistryRow>> = HashMap::new();
+        if let Some(by_id) = self.authoritative.get(kind) {
+            for (id, row) in by_id {
+                ids.push(id.clone());
+                rows.insert(id.clone(), Some(row.clone()));
+            }
+        }
         for batch in &self.pending {
             for op in &batch.ops {
-                if op.kind == kind && !ids.iter().any(|id| id == &op.id) {
+                if op.kind != kind {
+                    continue;
+                }
+                let slot = rows.entry(op.id.clone()).or_insert_with(|| {
                     ids.push(op.id.clone());
+                    None
+                });
+                if let (Some(next), _) = apply_op(slot.as_ref(), op) {
+                    *slot = Some(next);
                 }
             }
         }
-        ids.iter()
-            .filter_map(|id| self.overlay_row(kind, id))
+        ids.into_iter()
+            .filter_map(|id| rows.remove(&id).flatten())
+            .filter(|row| !row.deleted)
             .collect()
     }
 
