@@ -81,6 +81,44 @@ pub(crate) fn home_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/"))
 }
 
+/// `~` / `~/…` → this host's home directory. Anything else passes through.
+/// An unavailable home is an error so `~` never silently becomes `/`.
+pub(crate) fn expand_home(cwd: &str) -> Result<String, &'static str> {
+    match cwd.strip_prefix('~') {
+        Some("") => Ok(session_home_dir()?.to_string_lossy().into_owned()),
+        Some(rest) if rest.starts_with('/') => Ok(session_home_dir()?
+            .join(&rest[1..])
+            .to_string_lossy()
+            .into_owned()),
+        _ => Ok(cwd.to_string()),
+    }
+}
+
+/// Resolve the host user's home for a session that explicitly uses `~`.
+/// An absent home must not silently turn a projectless session into `/`.
+pub(crate) fn session_home_dir() -> Result<PathBuf, &'static str> {
+    session_home_dir_with(|name| std::env::var_os(name))
+}
+
+fn session_home_dir_with(
+    mut env: impl FnMut(&str) -> Option<std::ffi::OsString>,
+) -> Result<PathBuf, &'static str> {
+    #[cfg(windows)]
+    let names = ["USERPROFILE", "HOME"];
+    #[cfg(not(windows))]
+    let names = ["HOME", "USERPROFILE"];
+    for name in names {
+        let Some(value) = env(name).filter(|value| !value.is_empty()) else {
+            continue;
+        };
+        let path = PathBuf::from(value);
+        if path.is_absolute() && path.is_dir() && path.to_str().is_some() {
+            return Ok(path);
+        }
+    }
+    Err("User home directory unavailable on this device")
+}
+
 /// Where new worktrees live. Deliberately NOT under the backend data dir —
 /// worktrees are user-facing working checkouts. `ZERON_WORKTREES_DIR` overrides
 /// (test isolation); empty reads as unset.
@@ -100,6 +138,10 @@ struct ReposInner {
     github_avatars: std::sync::Mutex<HashMap<String, String>>,
     github_avatar_pages: std::sync::Mutex<HashSet<String>>,
     file_index: FileIndexCache,
+    /// HEAD commit → its trunk's root commit. History behind a commit never
+    /// changes, so the full first-parent walk runs once per HEAD, not on
+    /// every spaces repair pass.
+    trunk_roots: std::sync::Mutex<HashMap<String, String>>,
 }
 
 struct IndexedPath {
@@ -145,6 +187,7 @@ impl Repos {
                     .build()
                     .unwrap_or_else(|_| reqwest::Client::new()),
                 github_avatars: std::sync::Mutex::new(HashMap::new()),
+                trunk_roots: std::sync::Mutex::new(HashMap::new()),
                 github_avatar_pages: std::sync::Mutex::new(HashSet::new()),
                 file_index: std::sync::Mutex::new(HashMap::new()),
             }),
@@ -213,6 +256,40 @@ impl Repos {
             }));
         }
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    /// Like [`Self::git`], for commands that answer "no" with a silent exit
+    /// status 1 (`rev-parse --verify --quiet`): `Ok(None)` then, `Err` for
+    /// any other failure.
+    async fn git_probe(&self, args: &[&str], cwd: Option<&Path>) -> Result<Option<String>, EngineError> {
+        let mut cmd = tokio::process::Command::new("git");
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.as_std_mut().creation_flags(0x08000000);
+        }
+        cmd.args(args);
+        if let Some(cwd) = cwd {
+            cmd.current_dir(cwd);
+        }
+        cmd.stdin(std::process::Stdio::null());
+        let output = cmd
+            .output()
+            .await
+            .map_err(|e| EngineError::Other(format!("git spawn failed: {e}")))?;
+        if output.status.success() {
+            return Ok(Some(String::from_utf8_lossy(&output.stdout).trim().to_string()));
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if output.status.code() == Some(1) && stderr.trim().is_empty() {
+            return Ok(None);
+        }
+        Err(EngineError::Other(format!(
+            "git {} failed ({}): {}",
+            args.first().unwrap_or(&"?"),
+            output.status,
+            stderr.trim()
+        )))
     }
 
     /// Async existence probe with a timeout: a wedged network mount just reads
@@ -298,6 +375,123 @@ impl Repos {
             root: canonical_root,
             git_dir: canonical_git_dir,
         })
+    }
+
+    /// Identity shared by every clone and worktree of one repository: the
+    /// root commit its trunk grew from, `commit:<sha>`. Unlike a remote URL it
+    /// survives repository renames and transfers, SSH host aliases and
+    /// transport spellings, and it needs no network. Forks share it with
+    /// their upstream (the same codebase).
+    ///
+    /// A history that cannot vouch for its root — a shallow clone, or no
+    /// commits yet — falls back to the normalized `origin` remote (else the
+    /// first remote) as `host/owner/repo`, then to
+    /// `local:sha256(deviceId ‖ NUL ‖ canonical common git dir)`, so the
+    /// repository's worktrees on this device still match each other.
+    ///
+    /// A folder below the repository's top level carries its in-repository
+    /// path (`<identity>:apps/web`): sibling folders of one monorepo, or
+    /// plain folders inside an enclosing repository, stay separate projects,
+    /// while the same subfolder in another clone or worktree still matches.
+    ///
+    /// Errors are real failures (git missing, a lock, I/O) — never a silent
+    /// fallback to a different identity form, which would regroup the
+    /// sidebar on a transient hiccup. Callers keep their last value.
+    pub async fn repository_identity(&self, path: &Path) -> Result<String, EngineError> {
+        let base = match self.trunk_root_commit(path).await? {
+            Some(root) => format!("commit:{root}"),
+            None => self.remote_or_local_identity(path).await?,
+        };
+        let prefix = self.git(&["rev-parse", "--show-prefix"], Some(path)).await?;
+        let prefix = prefix.trim_end_matches('/');
+        Ok(if prefix.is_empty() {
+            base
+        } else {
+            format!("{base}:{prefix}")
+        })
+    }
+
+    /// The normalized remote, else the device-scoped common-git-dir hash.
+    async fn remote_or_local_identity(&self, path: &Path) -> Result<String, EngineError> {
+        let remote = match self.git(&["remote", "get-url", "origin"], Some(path)).await {
+            Ok(url) => Some(url),
+            Err(_) => match self.git(&["remote"], Some(path)).await {
+                Ok(names) => match names.lines().next() {
+                    Some(name) => self
+                        .git(&["remote", "get-url", name.trim()], Some(path))
+                        .await
+                        .ok(),
+                    None => None,
+                },
+                Err(_) => None,
+            },
+        };
+        if let Some(remote) = remote
+            .as_deref()
+            .and_then(crate::source_control::parse_git_remote)
+        {
+            return Ok(
+                format!("{}/{}/{}", remote.host, remote.owner, remote.repository)
+                    .to_ascii_lowercase(),
+            );
+        }
+        let common_dir = self
+            .git(
+                &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+                Some(path),
+            )
+            .await?;
+        let canonical =
+            std::fs::canonicalize(&common_dir).unwrap_or_else(|_| PathBuf::from(&common_dir));
+        let mut hasher = Sha256::new();
+        hasher.update(self.inner.device_id.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(canonical.to_string_lossy().as_bytes());
+        Ok(format!("local:{}", hex(&hasher.finalize())))
+    }
+
+    /// The root of HEAD's first-parent chain — the trunk's first commit. A
+    /// merged-in unrelated history arrives as a second parent, so its roots
+    /// never displace this one. `Ok(None)` when the history can't vouch for
+    /// a root: a shallow clone (its boundary commits only look parentless,
+    /// and differ with the fetch depth) or an unborn HEAD.
+    async fn trunk_root_commit(&self, path: &Path) -> Result<Option<String>, EngineError> {
+        let shallow = self
+            .git(&["rev-parse", "--is-shallow-repository"], Some(path))
+            .await?;
+        if shallow == "true" {
+            return Ok(None);
+        }
+        let Some(head) = self
+            .git_probe(&["rev-parse", "--verify", "--quiet", "HEAD^{commit}"], Some(path))
+            .await?
+        else {
+            return Ok(None); // unborn HEAD: no commits yet
+        };
+        if let Some(root) = self.inner.trunk_roots.lock().ok().and_then(|cache| cache.get(&head).cloned()) {
+            return Ok(Some(root));
+        }
+        let roots = self
+            .git(
+                &["rev-list", "--first-parent", "--max-parents=0", &head],
+                Some(path),
+            )
+            .await?;
+        let Some(root) = roots
+            .lines()
+            .map(str::trim)
+            .find(|sha| !sha.is_empty())
+            .map(str::to_owned)
+        else {
+            return Ok(None);
+        };
+        if let Ok(mut cache) = self.inner.trunk_roots.lock() {
+            if cache.len() >= 4096 {
+                cache.clear();
+            }
+            cache.insert(head, root.clone());
+        }
+        Ok(Some(root))
     }
 
     async fn to_repo(&self, path: &Path) -> Result<Repo, EngineError> {
@@ -1295,7 +1489,7 @@ impl Repos {
     ) -> Result<FolderListing, EngineError> {
         let target = match path.filter(|p| !p.trim().is_empty()) {
             Some(p) => absolutize(Path::new(&p)),
-            None => home_dir(),
+            None => session_home_dir().map_err(|error| EngineError::Other(error.to_string()))?,
         };
         let (tx, rx) = tokio::sync::oneshot::channel();
         let spawned = std::thread::Builder::new()
@@ -2153,6 +2347,18 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn session_home_requires_an_explicit_usable_directory() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(
+            session_home_dir_with(|name| (name == "HOME").then(|| home.path().as_os_str().into()))
+                .unwrap(),
+            home.path()
+        );
+        assert!(session_home_dir_with(|_| None).is_err());
+        assert!(session_home_dir_with(|name| (name == "HOME").then(|| "relative".into())).is_err());
+    }
+
     fn history_commit(sha: String, parent_sha: Option<String>) -> GitHistoryCommit {
         GitHistoryCommit {
             subject: sha.clone(),
@@ -2180,6 +2386,18 @@ mod tests {
             nucleo_matcher::Utf32String::from(candidate).slice(..),
             &mut matcher,
         )
+    }
+
+    #[test]
+    fn expand_home_rewrites_tilde_and_leaves_other_paths() {
+        let home = session_home_dir().unwrap();
+        assert_eq!(expand_home("~").unwrap(), home.to_string_lossy());
+        assert_eq!(
+            expand_home("~/proj").unwrap(),
+            home.join("proj").to_string_lossy()
+        );
+        assert_eq!(expand_home("/abs/path").unwrap(), "/abs/path");
+        assert_eq!(expand_home("~nope").unwrap(), "~nope");
     }
 
     #[test]

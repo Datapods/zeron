@@ -33,6 +33,14 @@ pub use server::{serve_connection, serve_ws_listener};
 /// RPC method names — single source of truth for both ends.
 /// Full surface: docs/research/feature-inventory.md §2.
 pub mod methods {
+    pub const VOICE_CAPABILITIES_V2: &str = "VoiceCapabilitiesV2";
+    pub const PREPARE_VOICE_V2: &str = "PrepareVoiceV2";
+    pub const OWN_VOICE_V2: &str = "OwnVoiceV2";
+    pub const NEGOTIATE_VOICE_V2: &str = "NegotiateVoiceV2";
+    pub const CONFIRM_VOICE_MEDIA_V2: &str = "ConfirmVoiceMediaV2";
+    pub const REPORT_VOICE_MEDIA_V2: &str = "ReportVoiceMediaV2";
+    pub const STOP_VOICE_V2: &str = "StopVoiceV2";
+    pub const CANCEL_VOICE_ATTEMPT_V2: &str = "CancelVoiceAttemptV2";
     pub const WATCH_PREVIEWS: &str = "WatchPreviews";
     pub const LIST_HARNESSES: &str = "ListHarnesses";
     pub const CANCEL_INSTALL: &str = "CancelInstall";
@@ -58,7 +66,11 @@ pub mod methods {
     /// fresh chat2 socket, host nudge, drain pass, and a new delivery escort
     /// per pending command. Params `{chatId}`; IPC-only.
     pub const RETRY_DELIVERY: &str = "RetryDelivery";
+    pub const FORK_SIDE_CHAT: &str = "ForkSideChat";
     pub const WATCH_DOC_MESSAGES: &str = "WatchDocMessages";
+    /// Explicit user navigation, `{chatId}`. Prioritizes this device's sync
+    /// connection; automatic subscriptions and retries must not call it.
+    pub const FOCUS_CHAT: &str = "FocusChat";
     /// Messages typed while the agent was busy, held on the chat doc so every
     /// device sees the same queue. `{ chatId }` → `{ items: QueuedMessage[] }`.
     pub const WATCH_QUEUE: &str = "WatchQueue";
@@ -159,6 +171,8 @@ pub mod methods {
     pub const SEARCH_WORKSPACE_FILES: &str = "SearchWorkspaceFiles";
     pub const READ_WORKSPACE_IMAGE: &str = "ReadWorkspaceImage";
     pub const READ_WORKSPACE_FILE: &str = "ReadWorkspaceFile";
+    pub const MOVE_WORKSPACE_ENTRY: &str = "MoveWorkspaceEntry";
+    pub const DELETE_WORKSPACE_ENTRY: &str = "DeleteWorkspaceEntry";
     pub const WRITE_WORKSPACE_FILE: &str = "WriteWorkspaceFile";
     pub const WATCH_WORKSPACE_FILES: &str = "WatchWorkspaceFiles";
     pub const CREATE_WORKTREE: &str = "CreateWorktree";
@@ -181,6 +195,9 @@ pub mod methods {
     /// Current pull request for one checkout, resolved on the checkout's host device.
     pub const WATCH_CHECKOUT_CHANGE_REQUEST: &str = "WatchCheckoutChangeRequest";
     pub const GET_CHECKOUT_DIFF: &str = "GetCheckoutDiff";
+    /// Permanently restore one chat-owned checkout to its current HEAD and
+    /// remove only its untracked, non-ignored paths.
+    pub const DISCARD_WORKING_TREE: &str = "DiscardWorkingTree";
     pub const GET_CHECKOUT_FILE_DIFF_TEXT: &str = "GetCheckoutFileDiffText";
     // Agent accounts (ControlRpc, relay-forwardable — CLI logins are per-device).
     pub const LIST_AGENT_ACCOUNTS: &str = "ListAgentAccounts";
@@ -203,6 +220,14 @@ pub mod methods {
     /// Download + apply the newest release on the target device (symlink-managed
     /// installs; the service restart is scheduled after the reply flushes).
     pub const APPLY_UPDATE: &str = "ApplyUpdate";
+    /// Device-local agent CLI update lifecycle. The stream emits the complete
+    /// ordered status list initially and after every transition.
+    pub const WATCH_HARNESS_UPDATES: &str = "WatchHarnessUpdates";
+    pub const CHECK_HARNESS_UPDATES: &str = "CheckHarnessUpdates";
+    pub const APPLY_HARNESS_UPDATE: &str = "ApplyHarnessUpdate";
+    pub const CANCEL_HARNESS_UPDATE: &str = "CancelHarnessUpdate";
+    pub const DISMISS_HARNESS_UPDATE: &str = "DismissHarnessUpdate";
+    pub const SET_HARNESS_UPDATE_POLICY: &str = "SetHarnessUpdatePolicy";
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -314,7 +339,10 @@ mod tests {
             method: &str,
             _params: serde_json::Value,
         ) -> Result<RpcReply, RpcError> {
-            if method != methods::WATCH_CHECKOUT_CHANGE_REQUEST {
+            if !matches!(
+                method,
+                methods::WATCH_CHECKOUT_CHANGE_REQUEST | methods::WATCH_HARNESS_UPDATES | "Silent"
+            ) {
                 return Err(RpcError::UnknownMethod(method.into()));
             }
             let guard = DropSignal(self.dropped.lock().unwrap().take());
@@ -323,6 +351,15 @@ mod tests {
                 drop(guard);
                 item
             });
+            if method == methods::WATCH_HARNESS_UPDATES {
+                // Update watches send an initial status snapshot, then may stay
+                // quiet indefinitely. Legacy peers do not send a readiness frame.
+                return Ok(RpcReply::Stream(
+                    futures::stream::once(async { serde_json::json!([]) })
+                        .chain(stream)
+                        .boxed(),
+                ));
+            }
             Ok(RpcReply::Stream(stream.boxed()))
         }
     }
@@ -424,6 +461,66 @@ mod tests {
             .await
             .expect("server stream cancelled")
             .expect("drop signal");
+    }
+
+    #[tokio::test]
+    async fn scoped_subscription_returns_before_first_item_and_cancels_silence() {
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let service = Arc::new(CancelAwareService {
+            dropped: Mutex::new(Some(dropped_tx)),
+        });
+        let client = memory_client(service.clone());
+        let stream = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.subscribe_scoped("Silent", serde_json::Value::Null),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        while service.dropped.lock().unwrap().is_some() {
+            tokio::task::yield_now().await;
+        }
+        drop(stream);
+        tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropping_one_device_update_watch_preserves_the_other() {
+        let (first_tx, first_rx) = tokio::sync::oneshot::channel();
+        let (second_tx, mut second_rx) = tokio::sync::oneshot::channel();
+        let first = memory_client(Arc::new(CancelAwareService {
+            dropped: Mutex::new(Some(first_tx)),
+        }));
+        let second = memory_client(Arc::new(CancelAwareService {
+            dropped: Mutex::new(Some(second_tx)),
+        }));
+        let first_watch = first
+            .subscribe_checked(methods::WATCH_HARNESS_UPDATES, serde_json::Value::Null)
+            .await
+            .unwrap();
+        let second_watch = second
+            .subscribe_checked(methods::WATCH_HARNESS_UPDATES, serde_json::Value::Null)
+            .await
+            .unwrap();
+
+        drop(first_watch);
+        tokio::time::timeout(std::time::Duration::from_secs(1), first_rx)
+            .await
+            .expect("first device's quiet stream cancelled")
+            .expect("first drop signal");
+        assert!(matches!(
+            second_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+
+        drop(second_watch);
+        tokio::time::timeout(std::time::Duration::from_secs(1), second_rx)
+            .await
+            .expect("second device's quiet stream cancelled")
+            .expect("second drop signal");
     }
 
     #[tokio::test]

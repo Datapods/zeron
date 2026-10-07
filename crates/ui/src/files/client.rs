@@ -24,7 +24,10 @@ pub struct FilesRequestContext {
 impl FilesRequestContext {
     pub fn for_chat(state: &AppState, chat_id: &str) -> Option<Self> {
         let chat = state.chats.iter().find(|chat| chat.id == chat_id)?;
-        let cwd = chat.cwd.clone()?;
+        let cwd = chat
+            .cwd
+            .clone()
+            .or_else(|| chat.space_id.is_none().then(|| "~".to_string()))?;
         let target_device_id = (state.local_device_id.as_deref() != Some(&chat.device_id))
             .then(|| chat.device_id.clone());
         Some(Self {
@@ -35,7 +38,9 @@ impl FilesRequestContext {
             },
             target_device_id,
             cwd,
-            checkout_id: chat.checkout_id.clone(),
+            // A projectless tree is rooted at the chat's directory, even if
+            // that directory happens to live inside a Git checkout.
+            checkout_id: chat.space_id.as_ref().and(chat.checkout_id.clone()),
         })
     }
 }
@@ -127,7 +132,7 @@ impl WorkspaceFilesClient {
     /// Refresh through the cached children before publishing the new listing.
     /// Usually this reads only the pages already visited. If a cached child is
     /// missing, reach the end before treating it as deleted.
-    pub(super) async fn list_directory_snapshot(
+    pub(crate) async fn list_directory_snapshot(
         &self,
         mut request: ListWorkspaceDirectoryRequest,
         cached_paths: &[String],
@@ -151,6 +156,11 @@ impl WorkspaceFilesClient {
                 }
                 request.cursor = Some(cursor);
                 let next = self.list_directory(request.clone()).await?;
+                if next.checkout_id != page.checkout_id {
+                    return Err(FilesClientError::Decode(
+                        "Workspace changed between directory pages".into(),
+                    ));
+                }
                 for entry in &next.entries {
                     remaining.remove(entry.path.as_str());
                 }
@@ -183,7 +193,9 @@ impl WorkspaceFilesClient {
     ) -> Result<(String, Vec<u8>), FilesClientError> {
         use base64::Engine as _;
         use zeron_proto::{MAX_WORKSPACE_IMAGE_BYTES, WORKSPACE_IMAGE_CHUNK_BYTES};
-        if checkout_id.is_empty() {
+        // Outside files carry no checkout identity — the device resolves
+        // them by absolute path.
+        if checkout_id.is_empty() && !path.starts_with('/') {
             return Err(FilesClientError::Decode(
                 "Workspace checkout identity unavailable".into(),
             ));
@@ -247,6 +259,20 @@ impl WorkspaceFilesClient {
         request: WriteWorkspaceFileRequest,
     ) -> Result<WriteWorkspaceFileOutcome, FilesClientError> {
         self.call(methods::WRITE_WORKSPACE_FILE, &request).await
+    }
+
+    pub async fn move_entry(
+        &self,
+        request: zeron_proto::MoveWorkspaceEntryRequest,
+    ) -> Result<zeron_proto::WorkspaceMutationOutcome, FilesClientError> {
+        self.call(methods::MOVE_WORKSPACE_ENTRY, &request).await
+    }
+
+    pub async fn delete_entry(
+        &self,
+        request: zeron_proto::DeleteWorkspaceEntryRequest,
+    ) -> Result<zeron_proto::WorkspaceMutationOutcome, FilesClientError> {
+        self.call(methods::DELETE_WORKSPACE_ENTRY, &request).await
     }
 
     pub async fn watch(&self) -> Result<mpsc::Receiver<serde_json::Value>, FilesClientError> {
@@ -349,6 +375,40 @@ mod tests {
         })
     }
 
+    #[tokio::test]
+    async fn structural_mutations_preserve_remote_addressing_and_never_retry_transport_errors() {
+        let transport = Arc::new(DeterministicTransport {
+            scripted_responses: Mutex::new([Err(RpcError::Transport("reply lost".into()))].into()),
+            ..Default::default()
+        });
+        let client = WorkspaceFilesClient::with_transport(
+            transport.clone(),
+            FilesRequestContext {
+                target: target(),
+                target_device_id: Some("host".into()),
+                cwd: "/remote".into(),
+                checkout_id: Some("checkout".into()),
+            },
+        );
+        let result = client
+            .move_entry(zeron_proto::MoveWorkspaceEntryRequest {
+                target: target(),
+                operation_id: "op".into(),
+                expected_checkout_id: "checkout".into(),
+                source_path: "a".into(),
+                destination_path: "folder/a".into(),
+                expected_source_revision: "rev".into(),
+                expected_kind: zeron_proto::WorkspaceEntryKind::File,
+            })
+            .await;
+        assert!(result.is_err());
+        let calls = transport.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, methods::MOVE_WORKSPACE_ENTRY);
+        assert_eq!(calls[0].1["targetDeviceId"], "host");
+        assert_eq!(calls[0].1["expectedCheckoutId"], "checkout");
+        assert_eq!(calls[0].1["sourcePath"], "a");
+    }
     #[tokio::test]
     async fn cached_directory_refresh_collects_pages_but_initial_load_stays_lazy() {
         for refresh in [false, true] {

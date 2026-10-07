@@ -1697,9 +1697,23 @@ pub struct Changes {
 }
 
 /// Events the host (the right pane's surface strip) listens for.
+#[derive(Debug, Clone)]
+pub struct DiscardWorkingTreeRequest {
+    pub chat_id: String,
+    pub checkout_id: String,
+    pub expected_checksum: String,
+    pub target_device_id: Option<String>,
+    pub file_count: usize,
+}
+
 pub enum ChangesEvent {
     /// A History row was clicked — open this commit as its own diff tab.
     OpenCommit(GitHistoryCommit),
+    /// Open the post-change path in the workspace file browser.
+    OpenFile(String),
+    /// The working-tree trash button was clicked. The shell owns the global
+    /// confirmation dialog and only then dispatches the destructive RPC.
+    DiscardWorkingTree(DiscardWorkingTreeRequest),
 }
 
 impl gpui::EventEmitter<ChangesEvent> for Changes {}
@@ -1932,6 +1946,24 @@ impl Changes {
             DiffScope::Branch | DiffScope::LatestTurn | DiffScope::Commit => self.scoped.clone(),
             DiffScope::History => None,
         }
+    }
+
+    fn discard_request(&self, cx: &App) -> Option<DiscardWorkingTreeRequest> {
+        if self.scope != DiffScope::WorkingTree {
+            return None;
+        }
+        let diff = self.resolved(cx)?;
+        if diff.truncated || (diff.files.is_empty() && diff.patch.trim().is_empty()) {
+            return None;
+        }
+        let chat = self.state.read(cx).selected_chat_row()?;
+        Some(DiscardWorkingTreeRequest {
+            chat_id: chat.id.clone(),
+            checkout_id: diff.checkout_id,
+            expected_checksum: diff.checksum,
+            target_device_id: self.desired_target(cx),
+            file_count: diff.files.len(),
+        })
     }
 
     /// Scope discriminant folded into the parse key, so a scope or base
@@ -2515,6 +2547,14 @@ impl Changes {
                     .get(&file.path)
                     .is_some_and(|fold| fold.collapsed)
             })
+    }
+
+    fn fold_all_label(&self) -> &'static str {
+        if self.all_collapsed() {
+            "Expand all files"
+        } else {
+            "Collapse all files"
+        }
     }
 
     /// Collapse every file section, or expand them all when everything is
@@ -3571,6 +3611,32 @@ impl Changes {
                         .child(SharedString::from(format!("−{dels}"))),
                 )
             })
+            .child(
+                div()
+                    .id(("diff-open-file", ix))
+                    .flex_none()
+                    .size(px(crate::surface_chrome::CONTROL_SIZE))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(crate::surface_chrome::CONTROL_RADIUS))
+                    .hover(|s| s.bg(theme.ink(0.08)))
+                    .on_mouse_down(gpui::MouseButton::Left, |_, window, cx| {
+                        window.prevent_default();
+                        cx.stop_propagation();
+                    })
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.stop_propagation();
+                        cx.emit(ChangesEvent::OpenFile(path.clone()));
+                    }))
+                    .tooltip(|_, cx| cx.new(|_| DiffHeaderTooltip("Open in file browser")).into())
+                    .tooltip_show_delay(Duration::from_millis(350))
+                    .child(
+                        crate::icons::icon(crate::icons::DOCUMENT)
+                            .size(px(crate::surface_chrome::ICON_SIZE))
+                            .text_color(theme.text_muted),
+                    ),
+            )
             .into_any_element()
     }
 
@@ -3637,9 +3703,10 @@ impl Changes {
     fn header_button(
         id: &'static str,
         icon_path: &'static str,
+        label: &'static str,
         theme: &Theme,
     ) -> gpui::Stateful<gpui::Div> {
-        Self::header_toggle(id, icon_path, false, theme)
+        Self::header_toggle(id, icon_path, label, false, theme)
     }
 
     /// [`Self::header_button`] with a latched look: an `active` toggle holds
@@ -3648,6 +3715,7 @@ impl Changes {
     fn header_toggle(
         id: &'static str,
         icon_path: &'static str,
+        label: &'static str,
         active: bool,
         theme: &Theme,
     ) -> gpui::Stateful<gpui::Div> {
@@ -3678,6 +3746,8 @@ impl Changes {
             .on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
                 window.prevent_default()
             })
+            .tooltip(move |_, cx| cx.new(|_| DiffHeaderTooltip(label)).into())
+            .tooltip_show_delay(Duration::from_millis(350))
             .child(
                 crate::icons::icon(icon_path)
                     .size(px(crate::surface_chrome::ICON_SIZE))
@@ -3695,6 +3765,7 @@ impl Changes {
         Self::header_toggle(
             "changes-split",
             crate::icons::SPLIT_COLUMNS,
+            "Split view",
             self.mode.is_split(),
             theme,
         )
@@ -3709,6 +3780,7 @@ impl Changes {
         Self::header_toggle(
             "changes-wrap",
             crate::icons::WRAP_TEXT,
+            "Wrap long lines",
             self.wrap_lines,
             theme,
         )
@@ -3716,8 +3788,6 @@ impl Changes {
             cx.stop_propagation();
             this.toggle_wrap(cx);
         }))
-        .tooltip(|_, cx| cx.new(|_| DiffHeaderTooltip("Wrap long lines")).into())
-        .tooltip_show_delay(Duration::from_millis(350))
         .into_any_element()
     }
 
@@ -3766,11 +3836,16 @@ impl Changes {
                 .child(self.split_toggle(&theme, cx))
                 .child(self.wrap_toggle(&theme, cx))
                 .child(
-                    Self::header_button("changes-fold-all", crate::icons::FOLD_VERTICAL, &theme)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.toggle_collapse_all(cx);
-                        })),
+                    Self::header_button(
+                        "changes-fold-all",
+                        crate::icons::FOLD_VERTICAL,
+                        self.fold_all_label(),
+                        &theme,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.toggle_collapse_all(cx);
+                    })),
                 )
                 .into_any_element();
         }
@@ -3881,29 +3956,56 @@ impl Changes {
                 .children(history_fetch_button)
                 .children(history_view_button)
                 .child(
-                    Self::header_button("history-refresh", crate::icons::REFRESH, &theme).on_click(
-                        cx.listener(|this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.history_pane(cx)
-                                .update(cx, |history, cx| history.refresh(cx));
-                        }),
-                    ),
+                    Self::header_button(
+                        "history-refresh",
+                        crate::icons::REFRESH,
+                        "Refresh",
+                        &theme,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.history_pane(cx)
+                            .update(cx, |history, cx| history.refresh(cx));
+                    })),
                 )
                 .into_any_element()
         } else {
+            let discard = self.discard_request(cx);
+            let discard_enabled = discard.is_some();
+            let discard_button = Self::header_button(
+                "changes-discard-working-tree",
+                crate::icons::TRASH_BIN_MINIMALISTIC,
+                "Discard changes",
+                &theme,
+            )
+            .when(!discard_enabled, |button| button.opacity(0.35))
+            .when_some(discard, |button, request| {
+                button.on_click(cx.listener(move |_, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.emit(ChangesEvent::DiscardWorkingTree(request.clone()));
+                }))
+            });
             div()
                 .flex_none()
                 .flex()
                 .items_center()
                 .gap(px(crate::surface_chrome::CONTROL_GAP))
+                .when(scope == DiffScope::WorkingTree, |element| {
+                    element.child(discard_button)
+                })
                 .child(self.split_toggle(&theme, cx))
                 .child(self.wrap_toggle(&theme, cx))
                 .child(
-                    Self::header_button("changes-fold-all", crate::icons::FOLD_VERTICAL, &theme)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.toggle_collapse_all(cx);
-                        })),
+                    Self::header_button(
+                        "changes-fold-all",
+                        crate::icons::FOLD_VERTICAL,
+                        self.fold_all_label(),
+                        &theme,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.toggle_collapse_all(cx);
+                    })),
                 )
                 .into_any_element()
         };
